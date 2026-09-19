@@ -1,10 +1,41 @@
 /* ============================================================================
    Sentinel AI — AI Content Detector
-   Pure vanilla JavaScript. No backend, no build step — everything runs
-   in the browser. pdf.js parses PDFs, mammoth.js parses DOCX files.
+   Pure vanilla JavaScript running entirely in the browser.
+
+   Detection:
+     • Primary  — transformers.js (Xenova) running a local RoBERTa
+                  text-classification model (Xenova/roberta-base-openai-detector)
+                  via WebAssembly. The model is downloaded on first load and
+                  then cached in the browser (Cache API) for instant loads.
+     • Fallback — a lightweight local heuristic (computeScore), used whenever
+                  the model isn't available (CDN offline, download failed…).
+
+   Document parsing: pdf.js (PDF) and mammoth.js (DOCX), both via CDN.
    ========================================================================== */
 
 'use strict';
+
+/* ---------------------------------------------------------------------------
+ * transformers.js — loaded from the CDN as an ES module (see <script
+ * type="module"> in index.html). The import is kicked off immediately so it
+ * downloads in parallel with the page, but we deliberately do NOT block the
+ * rest of the app on it: if the CDN is unreachable, the UI still works and
+ * analysis falls back to the built-in heuristic.
+ * ------------------------------------------------------------------------- */
+const TRANSFORMERS_CDN = 'https://cdn.jsdelivr.net/npm/@xenova/transformers';
+const transformersPromise = import(TRANSFORMERS_CDN).catch((err) => {
+  console.warn('[Sentinel] transformers.js failed to load:', err);
+  return null;
+});
+
+/* ---------------------------------------------------------------------------
+ * Configuration
+ * ------------------------------------------------------------------------- */
+const MODEL_ID = 'Xenova/roberta-base-openai-detector';
+const PDFJS_WORKER = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+const MAX_FILE_BYTES = 25 * 1024 * 1024; // 25 MB
+const ACCEPTED_EXTS = ['pdf', 'docx', 'txt', 'md'];
+const WORDS_PER_CHUNK = 300; // model limit is 512 tokens; ~300 words stays safely under it
 
 /* ---------------------------------------------------------------------------
  * Element references
@@ -36,6 +67,7 @@ const progressWrap   = $('progressWrap');
 const progressBar    = $('progressBar');
 const progressLabel  = $('progressLabel');
 const resultWrap     = $('resultWrap');
+const resultMethod   = $('resultMethod');
 
 const aiRing       = $('aiRing');
 const aiPercent    = $('aiPercent');
@@ -48,15 +80,14 @@ const wordCountLn  = $('wordCountLine');
 const metricBars = [$('metric1Bar'), $('metric2Bar'), $('metric3Bar')];
 const metricVals = [$('metric1Val'), $('metric2Val'), $('metric3Val')];
 
+const modelStatus     = $('modelStatus');
+const modelStatusIcon = $('modelStatusIcon');
+const modelStatusTitle = $('modelStatusTitle');
+const modelStatusSub  = $('modelStatusSub');
+const modelStatusPct  = $('modelStatusPct');
+const modelRetryBtn   = $('modelRetryBtn');
+
 const toastContainer = $('toastContainer');
-
-/* ---------------------------------------------------------------------------
- * Configuration
- * ------------------------------------------------------------------------- */
-const PDFJS_WORKER = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-const MAX_FILE_BYTES = 25 * 1024 * 1024; // 25 MB
-
-const ACCEPTED_EXTS = ['pdf', 'docx', 'txt', 'md'];
 
 /* ---------------------------------------------------------------------------
  * Small utilities
@@ -96,7 +127,7 @@ function toast(message, type = 'info') {
 function updateStats() {
   const text  = textarea.value;
   const chars = text.length;
-  const words = text.trim() ? text.trim().split(/\s+/).length : 0;
+  const words = text.trim() ? text.trim().split(/\s+/g).length : 0;
 
   statChars.textContent = `${chars.toLocaleString()} chars`;
   statWords.textContent = `${words.toLocaleString()} words`;
@@ -107,6 +138,204 @@ function updateStats() {
   if (!isAnalyzing) analyzeBtn.disabled = words === 0;
 }
 textarea.addEventListener('input', updateStats);
+
+/* ---------------------------------------------------------------------------
+ * AI model: loading + status indicator
+ * ------------------------------------------------------------------------- */
+let classifier = null; // the loaded text-classification pipeline
+let modelReady = false;
+let modelLoading = false;
+
+const STATUS_ICONS = {
+  spinner:
+    '<svg class="h-5 w-5 animate-spin" viewBox="0 0 24 24" fill="none"><circle class="opacity-20" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round"/></svg>',
+  check:
+    '<svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>',
+  alert:
+    '<svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>',
+};
+
+/**
+ * Render the model status banner.
+ * @param {'loading'|'progress'|'ready'|'error'} state
+ * @param {number|string} [detail] download percentage (progress) or message (error)
+ */
+function setModelStatus(state, detail = null) {
+  modelStatus.hidden = false;
+  modelStatus.classList.remove('opacity-0');
+
+  const THEMES = {
+    loading: { box: 'border-amber-500/30 bg-amber-500/10', icon: 'bg-amber-500/15 text-amber-300', title: 'text-amber-200', sub: 'text-amber-200/60' },
+    ready:   { box: 'border-emerald-500/30 bg-emerald-500/10', icon: 'bg-emerald-500/15 text-emerald-300', title: 'text-emerald-200', sub: 'text-emerald-200/60' },
+    error:   { box: 'border-rose-500/30 bg-rose-500/10', icon: 'bg-rose-500/15 text-rose-300', title: 'text-rose-200', sub: 'text-rose-200/70' },
+  };
+  const theme = THEMES[state === 'progress' ? 'loading' : state];
+  modelStatus.className =
+    `mb-6 flex items-center gap-4 rounded-xl border px-5 py-4 backdrop-blur-xl transition-opacity duration-300 ${theme.box}`;
+  modelStatusIcon.className = `flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${theme.icon}`;
+
+  switch (state) {
+    case 'progress':
+      modelStatusIcon.innerHTML = STATUS_ICONS.spinner;
+      modelStatusTitle.textContent = 'Downloading AI Model…';
+      modelStatusSub.textContent = '(This may take a minute on first load)';
+      modelStatusPct.textContent = `${detail}%`;
+      modelStatusPct.classList.remove('hidden');
+      modelRetryBtn.classList.add('hidden');
+      break;
+    case 'loading':
+      modelStatusIcon.innerHTML = STATUS_ICONS.spinner;
+      modelStatusTitle.textContent = 'Downloading AI Model…';
+      modelStatusSub.textContent = '(This may take a minute on first load)';
+      modelStatusPct.textContent = '—';
+      modelStatusPct.classList.remove('hidden');
+      modelRetryBtn.classList.add('hidden');
+      break;
+    case 'ready':
+      modelStatusIcon.innerHTML = STATUS_ICONS.check;
+      modelStatusTitle.textContent = 'AI detection model ready';
+      modelStatusSub.textContent = 'Cached in your browser — all analysis stays on your device.';
+      modelStatusPct.classList.add('hidden');
+      modelRetryBtn.classList.add('hidden');
+      break;
+    case 'error':
+      modelStatusIcon.innerHTML = STATUS_ICONS.alert;
+      modelStatusTitle.textContent = 'Model failed to load';
+      modelStatusSub.textContent =
+        detail || 'Check your internet connection. Analysis will use the built-in heuristic until the model is available.';
+      modelStatusPct.classList.add('hidden');
+      modelRetryBtn.classList.remove('hidden');
+      break;
+  }
+}
+
+function hideModelStatus() {
+  if (modelStatus.hidden) return;
+  modelStatus.classList.add('opacity-0');
+  setTimeout(() => { modelStatus.hidden = true; }, 350);
+}
+
+/**
+ * Load the text-classification pipeline. transformers.js downloads the model
+ * weights on first use and caches them in the browser (Cache API), so later
+ * visits load it instantly.
+ */
+async function loadModel() {
+  if (classifier) return classifier;
+
+  const transformers = await transformersPromise;
+  if (!transformers) {
+    throw new Error('The transformers.js CDN is unreachable.');
+  }
+
+  modelLoading = true;
+  try {
+    classifier = await transformers.pipeline('text-classification', MODEL_ID, {
+      quantized: true,
+      progress_callback: createDownloadTracker(),
+    });
+    return classifier;
+  } finally {
+    modelLoading = false;
+  }
+}
+
+/**
+ * Aggregate per-file download events from transformers.js into one overall
+ * percentage for the status banner.
+ */
+function createDownloadTracker() {
+  const files = new Map();
+  return (p) => {
+    if (!p || !p.file) return;
+    const rec = files.get(p.file) || {};
+    if (p.total) rec.total = p.total;
+    if (p.status === 'progress' && p.loaded != null) rec.loaded = p.loaded;
+    if (p.status === 'done') rec.loaded = rec.total || 0;
+    files.set(p.file, rec);
+
+    let loaded = 0;
+    let total = 0;
+    for (const r of files.values()) {
+      loaded += r.loaded || 0;
+      total += r.total || 0;
+    }
+    if (total > 0) setModelStatus('progress', Math.min(100, Math.round((loaded / total) * 100)));
+  };
+}
+
+/** Kick off model loading on page load. */
+async function initModel() {
+  setModelStatus('loading');
+  try {
+    await loadModel();
+    modelReady = true;
+    setModelStatus('ready');
+    setTimeout(hideModelStatus, 2000); // brief "ready" flash, then dismiss
+  } catch (err) {
+    console.error('[Sentinel] Model load failed:', err);
+    setModelStatus('error', err && err.message ? err.message : null);
+  }
+}
+
+modelRetryBtn.addEventListener('click', () => {
+  setModelStatus('loading');
+  initModel();
+});
+
+/* ---------------------------------------------------------------------------
+ * Text chunking
+ * ------------------------------------------------------------------------- */
+/**
+ * Split long text into chunks of ~`targetWords` words (default 300), breaking
+ * on sentence boundaries so no sentence is cut in half.
+ *
+ * The model accepts at most 512 tokens; ~300 words of English is roughly
+ * 380–420 tokens, leaving safe headroom for the [CLS]/[SEP] special tokens.
+ *
+ * @param {string} text
+ * @param {number} [targetWords=WORDS_PER_CHUNK]
+ * @returns {string[]} array of text chunks
+ */
+function chunkText(text, targetWords = WORDS_PER_CHUNK) {
+  const sentences = text
+    .split(/(?<=[.!?…])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const chunks = [];
+  let current = [];
+  let wordCount = 0;
+
+  const flush = () => {
+    if (current.length) {
+      chunks.push(current.join(' '));
+      current = [];
+      wordCount = 0;
+    }
+  };
+
+  for (const sentence of sentences) {
+    const wc = (sentence.match(/\S+/g) || []).length;
+
+    // A single "sentence" longer than the whole budget: hard-split by words.
+    if (wc > targetWords) {
+      flush();
+      const words = sentence.split(/\s+/);
+      for (let i = 0; i < words.length; i += targetWords) {
+        chunks.push(words.slice(i, i + targetWords).join(' '));
+      }
+      continue;
+    }
+
+    if (wordCount + wc > targetWords) flush();
+    current.push(sentence);
+    wordCount += wc;
+  }
+  flush();
+
+  return chunks.length ? chunks : [text];
+}
 
 /* ---------------------------------------------------------------------------
  * File upload: button, dropzone drag & drop
@@ -171,7 +400,7 @@ async function handleFile(file) {
   setDropzone('loading', `Reading ${file.name}…`);
   try {
     let text;
-    if (ext === 'pdf')      text = await extractPdfText(file);
+    if (ext === 'pdf')       text = await extractPdfText(file);
     else if (ext === 'docx') text = await extractDocxText(file);
     else                     text = await file.text(); // .txt and .md — plain text
 
@@ -256,7 +485,6 @@ async function extractDocxText(file) {
   const arrayBuffer = await file.arrayBuffer();
   const result = await mammoth.extractRawText({ arrayBuffer });
   if (result && result.messages && result.messages.length > 0) {
-    // Non-fatal warnings from mammoth (e.g. unsupported styles) — ignore.
     const hasErrors = result.messages.some((m) => m.type === 'error');
     if (hasErrors && !(result.value || '').trim()) {
       throw new Error('mammoth.js could not extract text from this DOCX file.');
@@ -268,9 +496,12 @@ async function extractDocxText(file) {
 /* ---------------------------------------------------------------------------
  * Analysis flow
  *
- * NOTE: computeScore() below is a lightweight PLACEHOLDER heuristic so the
- * demo works end-to-end. Swap its internals for a real detection engine when
- * available — the UI only consumes { score, metrics[] }.
+ * Primary path: text is split into ~300-word chunks (chunkText), each chunk
+ * is classified by the local RoBERTa model, and the AI probabilities are
+ * averaged into one score.
+ *
+ * Fallback path: computeScore() — a lightweight local heuristic — keeps the
+ * demo working when the model isn't loaded.
  * ------------------------------------------------------------------------- */
 let isAnalyzing = false;
 
@@ -301,6 +532,58 @@ function animateProgress() {
     requestAnimationFrame(frame);
   });
 }
+
+/* -------------------------- Model-based analysis ------------------------- */
+
+/** True when a model label denotes AI/machine-generated text. */
+function isAILabel(label) {
+  const l = String(label || '').toLowerCase();
+  if (l === 'label_1') return true;  // detector convention: LABEL_0 = human, LABEL_1 = AI
+  if (l === 'label_0') return false;
+  if (/(^|[^a-z])(ai|artificial|machine|generated|synthetic)([^a-z]|$)/.test(l)) return true;
+  if (/human|authentic|organic/.test(l)) return false;
+  return false; // unknown label: conservatively treat as human
+}
+
+/** Convert a chunk's classification output into an AI probability (0–1). */
+function chunkAiProbability(classification) {
+  const top = (classification && classification[0]) || { label: 'label_0', score: 0.5 };
+  return isAILabel(top.label) ? top.score : 1 - top.score;
+}
+
+/**
+ * Classify the full text with the local model, chunk by chunk.
+ * Updates the progress bar/label as each chunk is processed.
+ */
+async function runModelAnalysis(text) {
+  const chunks = chunkText(text);
+  let aiSum = 0;
+
+  for (let i = 0; i < chunks.length; i++) {
+    progressBar.style.width = Math.round((i / chunks.length) * 100) + '%';
+    progressLabel.textContent =
+      chunks.length === 1
+        ? 'Running AI detection…'
+        : `Classifying section ${i + 1} of ${chunks.length}…`;
+
+    const result = await classifier(chunks[i], { top_k: 2 });
+    aiSum += chunkAiProbability(result);
+
+    progressBar.style.width = Math.round(((i + 1) / chunks.length) * 100) + '%';
+  }
+
+  const score = clamp(Math.round((aiSum / chunks.length) * 100), 2, 98);
+  const supporting = computeScore(text); // heuristic metrics, shown as signal bars
+  return {
+    score,
+    metrics: supporting.metrics,
+    total: supporting.total,
+    sentences: supporting.sentences,
+    method: 'model',
+  };
+}
+
+/* --------------------- Heuristic fallback (placeholder) ------------------- */
 
 /** Well-known LLM-typical words and phrases. */
 const AI_PHRASES = [
@@ -358,24 +641,26 @@ function computeScore(text) {
   };
 }
 
+/* ------------------------------- Verdicts --------------------------------- */
+
 const VERDICTS = {
   ai: {
     title: 'Likely AI-generated',
-    desc: 'The rhythm, vocabulary and phrasing of this text match statistical patterns typical of large-language-model output. Treat it as AI-written until a human confirms otherwise.',
+    desc: 'The model assigns a high probability of machine-generated text to this content. Treat it as AI-written until a human confirms otherwise.',
     color: '#fb7185',
     badge: 'border-rose-500/40 bg-rose-500/10 text-rose-300',
     dot: 'bg-rose-400',
   },
   mixed: {
     title: 'Mixed signals',
-    desc: 'Some passages look machine-generated while others feel human. This often happens when AI text has been edited, expanded or paraphrased by a person.',
+    desc: 'This content shows a moderate probability of AI generation. It may be partly machine-written — or AI text that has been heavily edited by a human.',
     color: '#fbbf24',
     badge: 'border-amber-500/40 bg-amber-500/10 text-amber-300',
     dot: 'bg-amber-400',
   },
   human: {
     title: 'Likely human-written',
-    desc: 'Sentence rhythm, word variety and phrasing look naturally human. No strong machine-writing signals were detected in this sample.',
+    desc: 'The model assigns a low probability of machine-generated text to this content. No strong machine-writing signals were detected in this sample.',
     color: '#34d399',
     badge: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300',
     dot: 'bg-emerald-400',
@@ -412,6 +697,10 @@ function renderResult(result) {
   verdictDesc.textContent = spec.desc;
   wordCountLn.textContent =
     `${result.total.toLocaleString()} words · ${result.sentences.toLocaleString()} sentences analyzed`;
+  resultMethod.textContent =
+    result.method === 'model'
+      ? `Local RoBERTa detector · ${MODEL_ID} · runs in your browser via WebAssembly`
+      : 'Heuristic estimate — computed locally in your browser (AI model not loaded)';
 
   // Count-up: number + conic ring stay in sync.
   animateNumber(aiPercent, result.score, 1000, (val) =>
@@ -429,6 +718,8 @@ function renderResult(result) {
   );
 }
 
+/* ------------------------------ Orchestration ----------------------------- */
+
 async function runAnalysis() {
   const text = textarea.value.trim();
   if (!text || isAnalyzing) return;
@@ -445,9 +736,25 @@ async function runAnalysis() {
   analyzeIcon.classList.add('hidden');
   analyzeSpin.classList.remove('hidden');
 
-  await animateProgress();
-  renderResult(computeScore(text));
+  let result;
+  if (modelReady && classifier) {
+    try {
+      result = await runModelAnalysis(text);
+    } catch (err) {
+      console.error('[Sentinel] Model inference failed:', err);
+      toast('The AI model failed during analysis — falling back to the built-in heuristic.', 'error');
+      await animateProgress();
+      result = { ...computeScore(text), method: 'heuristic' };
+    }
+  } else {
+    if (modelLoading) {
+      toast('The AI model is still loading — using the built-in heuristic this time.', 'info');
+    }
+    await animateProgress();
+    result = { ...computeScore(text), method: 'heuristic' };
+  }
 
+  renderResult(result);
   progressWrap.classList.add('hidden');
   resultWrap.classList.remove('hidden');
 
@@ -456,7 +763,12 @@ async function runAnalysis() {
   analyzeLabel.textContent = 'Analyze Content';
   analyzeIcon.classList.remove('hidden');
   analyzeSpin.classList.add('hidden');
-  toast('Analysis complete.', 'success');
+  toast(
+    result.method === 'model'
+      ? 'Analysis complete — scored by the local AI detector.'
+      : 'Analysis complete — heuristic estimate.',
+    'success'
+  );
 }
 
 analyzeBtn.addEventListener('click', runAnalysis);
@@ -499,3 +811,4 @@ if (typeof pdfjsLib !== 'undefined') {
 }
 
 updateStats();
+initModel(); // starts the "Downloading AI Model…" flow on page load
