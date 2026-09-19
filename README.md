@@ -30,10 +30,22 @@ python3 -m http.server 8080
 
 ## Files
 
-| File         | Purpose                                                    |
-| ------------ | ---------------------------------------------------------- |
-| `index.html` | Dashboard UI (Tailwind via CDN, dark SaaS theme)           |
-| `script.js`  | File parsing, live stats, analysis flow, results rendering |
+| File           | Purpose                                                    |
+| -------------- | ---------------------------------------------------------- |
+| `index.html`   | Dashboard UI (Tailwind via CDN, dark SaaS theme)           |
+| `script.js`    | File parsing, model loading, analysis flow, results        |
+| `tests/verify.mjs` | Dev-only logic verification suite (Node)             |
+| `REPORT.md`    | Verification report, production assessment, improvement plan |
+
+## Verification
+
+```bash
+node tests/verify.mjs
+```
+
+Runs 40 checks against the core logic extracted from `script.js` — chunking stress-tested up to 1,000,000 words, weighted scoring, label mapping, verdict thresholds, cancellation, and heuristic-fallback discrimination. (Dev-only; the app itself runs with no Node.js.)
+
+Full results, production-readiness assessment and the improvement plan are in [REPORT.md](REPORT.md).
 
 ## Detection pipeline
 

@@ -61,6 +61,7 @@ const analyzeLabel = $('analyzeLabel');
 const analyzeIcon  = $('analyzeIcon');
 const analyzeSpin  = $('analyzeSpinner');
 const clearBtn     = $('clearBtn');
+const cancelBtn    = $('cancelBtn');
 
 const resultsSection = $('resultsSection');
 const progressWrap   = $('progressWrap');
@@ -141,7 +142,15 @@ function updateStats() {
   // Requirement: Analyze stays disabled until there is text in the textarea.
   if (!isAnalyzing) analyzeBtn.disabled = words === 0;
 }
-textarea.addEventListener('input', updateStats);
+// Debounced, so typing or pasting very large text stays smooth.
+let statsTimer = null;
+textarea.addEventListener('input', () => {
+  if (statsTimer) return;
+  statsTimer = setTimeout(() => {
+    statsTimer = null;
+    updateStats();
+  }, 120);
+});
 
 /* ---------------------------------------------------------------------------
  * AI model: loading + status indicator
@@ -508,6 +517,15 @@ async function extractDocxText(file) {
  * demo working when the model isn't loaded.
  * ------------------------------------------------------------------------- */
 let isAnalyzing = false;
+let cancelRequested = false;
+
+/** Thrown from classifyChunks() when the user cancels a running analysis. */
+class AnalysisCancelled extends Error {
+  constructor() {
+    super('Analysis cancelled by user.');
+    this.name = 'AnalysisCancelled';
+  }
+}
 
 const STAGES = [
   { at: 0,  label: 'Tokenizing document…' },
@@ -583,6 +601,7 @@ async function classifyChunks(chunks, text, onChunk) {
   let totalWeight = 0;
 
   for (let i = 0; i < chunks.length; i++) {
+    if (cancelRequested) throw new AnalysisCancelled();
     // Paint the current state before this chunk's (synchronous) inference.
     await yieldToBrowser();
 
@@ -755,6 +774,9 @@ async function runAnalysis() {
   if (!text || isAnalyzing) return;
 
   isAnalyzing = true;
+  let cancelled = false;
+  let result = null;
+
   resultsSection.hidden = false;
   resultWrap.classList.add('hidden');
   progressWrap.classList.remove('hidden');
@@ -766,28 +788,50 @@ async function runAnalysis() {
   analyzeIcon.classList.add('hidden');
   analyzeSpin.classList.remove('hidden');
 
-  let result;
   if (modelReady && classifier) {
     try {
       // 1) Take the textarea text and run it through the chunking function.
       const chunks = chunkText(text);
 
-      // 2) Button: spinner + "Analyzing… 0/X chunks".
-      setButtonProgress(chunks.length, 0);
+      // Any size is supported — just confirm before a very long run.
+      if (
+        chunks.length > MAX_CHUNKS_WITHOUT_CONFIRM &&
+        !window.confirm(
+          `This document is very large (~${chunks.length.toLocaleString()} sections).\n` +
+            'The analysis may take many minutes.\n\nContinue?'
+        )
+      ) {
+        cancelled = true;
+      }
 
-      // 3–5) Classify every chunk with the pipeline and combine the
-      //      per-chunk Fake/AI probabilities into one weighted average.
-      result = await classifyChunks(chunks, text, (done, total) => {
-        setButtonProgress(total, done);
-        progressBar.style.width = Math.round((done / total) * 100) + '%';
-        progressLabel.textContent =
-          total === 1 ? 'Running AI detection…' : `Classifying section ${done} of ${total}…`;
-      });
+      if (!cancelled) {
+        if (chunks.length > LARGE_CHUNKS_HINT) {
+          toast(`Large document: ${chunks.length.toLocaleString()} sections — you can cancel anytime.`, 'info');
+        }
+
+        // 2) Button: spinner + "Analyzing… 0/X chunks".
+        cancelRequested = false;
+        setButtonProgress(chunks.length, 0);
+        cancelBtn.classList.remove('hidden');
+
+        // 3–5) Classify every chunk with the pipeline and combine the
+        //      per-chunk Fake/AI probabilities into one weighted average.
+        result = await classifyChunks(chunks, text, (done, total) => {
+          setButtonProgress(total, done);
+          progressBar.style.width = Math.round((done / total) * 100) + '%';
+          progressLabel.textContent =
+            total === 1 ? 'Running AI detection…' : `Classifying section ${done} of ${total}…`;
+        });
+      }
     } catch (err) {
-      console.error('[Sentinel] Model inference failed:', err);
-      toast('The AI model failed during analysis — falling back to the built-in heuristic.', 'error');
-      await animateProgress();
-      result = { ...computeScore(text), method: 'heuristic' };
+      if (err instanceof AnalysisCancelled) {
+        cancelled = true;
+      } else {
+        console.error('[Sentinel] Model inference failed:', err);
+        toast('The AI model failed during analysis — falling back to the built-in heuristic.', 'error');
+        await animateProgress();
+        result = { ...computeScore(text), method: 'heuristic' };
+      }
     }
   } else {
     if (modelLoading) {
@@ -797,16 +841,24 @@ async function runAnalysis() {
     result = { ...computeScore(text), method: 'heuristic' };
   }
 
-  // 6) Show the results: AI percentage ring, headline and verdict.
-  renderResult(result);
-  progressWrap.classList.add('hidden');
-  resultWrap.classList.remove('hidden');
-
+  cancelBtn.classList.add('hidden');
   isAnalyzing = false;
   analyzeBtn.disabled = !textarea.value.trim();
   analyzeLabel.textContent = 'Analyze Content';
   analyzeIcon.classList.remove('hidden');
   analyzeSpin.classList.add('hidden');
+
+  if (cancelled || !result) {
+    progressWrap.classList.add('hidden');
+    resultsSection.hidden = true;
+    toast('Analysis cancelled — nothing was changed.', 'info');
+    return;
+  }
+
+  // 6) Show the results: AI percentage ring, headline and verdict.
+  renderResult(result);
+  progressWrap.classList.add('hidden');
+  resultWrap.classList.remove('hidden');
   toast(
     result.method === 'model'
       ? 'Analysis complete — scored by the local AI detector.'
@@ -816,6 +868,9 @@ async function runAnalysis() {
 }
 
 analyzeBtn.addEventListener('click', runAnalysis);
+cancelBtn.addEventListener('click', () => {
+  if (isAnalyzing) cancelRequested = true;
+});
 
 // Ctrl/⌘ + Enter also triggers analysis.
 document.addEventListener('keydown', (e) => {
@@ -851,6 +906,12 @@ document.querySelectorAll('a[href="#"]').forEach((a) =>
 );
 
 if (typeof pdfjsLib !== 'undefined') {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER;
+}
+
+updateStats();
+initModel(); // starts the "Downloading AI Model…" flow on page load
+{
   pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER;
 }
 
