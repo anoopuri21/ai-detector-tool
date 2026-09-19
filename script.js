@@ -10,6 +10,10 @@
      • Fallback — a lightweight local heuristic (computeScore), used whenever
                   the model isn't available (CDN offline, download failed…).
 
+   Humanize (experimental):
+     • A small local LLM (Xenova/tinyllama-1.1b-chat-v0.3, ~600 MB one-time,
+       free & private) rewrites AI-sounding text to sound more human.
+
    Document parsing: pdf.js (PDF) and mammoth.js (DOCX), both via CDN.
    ========================================================================== */
 
@@ -22,7 +26,7 @@
  * rest of the app on it: if the CDN is unreachable, the UI still works and
  * analysis falls back to the built-in heuristic.
  * ------------------------------------------------------------------------- */
-const TRANSFORMERS_CDN = 'https://cdn.jsdelivr.net/npm/@xenova/transformers';
+const TRANSFORMERS_CDN = 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2'; // pinned for stability
 const transformersPromise = import(TRANSFORMERS_CDN).catch((err) => {
   console.warn('[Sentinel] transformers.js failed to load:', err);
   return null;
@@ -32,10 +36,14 @@ const transformersPromise = import(TRANSFORMERS_CDN).catch((err) => {
  * Configuration
  * ------------------------------------------------------------------------- */
 const MODEL_ID = 'Xenova/roberta-base-openai-detector';
+const REWRITER_MODEL = 'Xenova/tinyllama-1.1b-chat-v0.3'; // local LLM for AI→Human rewrite (experimental)
 const PDFJS_WORKER = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 const MAX_FILE_BYTES = 25 * 1024 * 1024; // 25 MB
 const ACCEPTED_EXTS = ['pdf', 'docx', 'txt', 'md'];
 const WORDS_PER_CHUNK = 300; // model limit is 512 tokens; ~300 words stays safely under it
+const REWRITE_CHUNK_WORDS = 250; // rewriter chunk size (prompt + reply must fit the LLM context)
+const LARGE_CHUNKS_HINT = 15;           // more sections than this → "this may take a while"
+const MAX_CHUNKS_WITHOUT_CONFIRM = 500; // more than this → ask for explicit confirmation
 
 /* ---------------------------------------------------------------------------
  * Element references
@@ -81,6 +89,21 @@ const wordCountLn  = $('wordCountLine');
 
 const metricBars = [$('metric1Bar'), $('metric2Bar'), $('metric3Bar')];
 const metricVals = [$('metric1Val'), $('metric2Val'), $('metric3Val')];
+
+const chunkBreakdownWrap = $('chunkBreakdownWrap');
+const chunkBreakdown = $('chunkBreakdown');
+const copyReportBtn = $('copyReportBtn');
+const downloadReportBtn = $('downloadReportBtn');
+
+const rewriteSection = $('rewriteSection');
+
+const rewriteStatus = $('rewriteStatus');
+const rewriteBtn = $('rewriteBtn');
+const rewriteCancelBtn = $('rewriteCancelBtn');
+const rewriteOutput = $('rewriteOutput');
+const rewriteUseBtn = $('rewriteUseBtn');
+const rewriteCopyBtn = $('rewriteCopyBtn');
+const rewriteDownloadBtn = $('rewriteDownloadBtn');
 
 const modelStatus     = $('modelStatus');
 const modelStatusIcon = $('modelStatusIcon');
@@ -141,6 +164,7 @@ function updateStats() {
 
   // Requirement: Analyze stays disabled until there is text in the textarea.
   if (!isAnalyzing) analyzeBtn.disabled = words === 0;
+  if (!rewriteBusy) rewriteBtn.disabled = words === 0;
 }
 // Debounced, so typing or pasting very large text stays smooth.
 let statsTimer = null;
@@ -511,10 +535,10 @@ async function extractDocxText(file) {
  *
  * Primary path: text is split into ~300-word chunks (chunkText), each chunk
  * is classified by the local RoBERTa model, and the AI probabilities are
- * averaged into one score.
+ * averaged (word-weighted) into one score.
  *
  * Fallback path: computeScore() — a lightweight local heuristic — keeps the
- * demo working when the model isn't loaded.
+ * app working when the model isn't loaded.
  * ------------------------------------------------------------------------- */
 let isAnalyzing = false;
 let cancelRequested = false;
@@ -594,11 +618,14 @@ function chunkAiProbability(classification) {
  * @param {string} text       full original text (for supporting metrics)
  * @param {(done: number, total: number) => void} [onChunk]
  *        called after every chunk — drives "Analyzing… i/X chunks" + progress bar
+ * @returns {Promise<{score, metrics, total, sentences, method, perChunk}>}
+ *          perChunk: [{ pct, words }] — per-section AI scores for the UI
  */
 async function classifyChunks(chunks, text, onChunk) {
   const weights = chunks.map((c) => (c.match(/\S+/g) || []).length || 1);
   let weightedSum = 0;
   let totalWeight = 0;
+  const perChunk = [];
 
   for (let i = 0; i < chunks.length; i++) {
     if (cancelRequested) throw new AnalysisCancelled();
@@ -609,6 +636,7 @@ async function classifyChunks(chunks, text, onChunk) {
 
     weightedSum += fakeProbability * weights[i];
     totalWeight += weights[i];
+    perChunk.push({ pct: Math.round(fakeProbability * 100), words: weights[i] });
 
     if (onChunk) onChunk(i + 1, chunks.length);
     await yieldToBrowser();
@@ -623,6 +651,7 @@ async function classifyChunks(chunks, text, onChunk) {
     total: supporting.total,
     sentences: supporting.sentences,
     method: 'model',
+    perChunk,
   };
 }
 
@@ -729,7 +758,10 @@ function animateNumber(el, target, duration, onStep) {
   requestAnimationFrame(frame);
 }
 
+let lastResult = null;
+
 function renderResult(result) {
+  lastResult = result;
   const spec = VERDICTS[verdictOf(result.score)];
 
   aiRing.style.setProperty('--ring-color', spec.color);
@@ -760,7 +792,90 @@ function renderResult(result) {
       });
     })
   );
+
+  // Section breakdown — shows WHERE the AI signal concentrates (model runs only).
+  if (result.method === 'model' && Array.isArray(result.perChunk) && result.perChunk.length) {
+    chunkBreakdownWrap.classList.remove('hidden');
+    chunkBreakdown.innerHTML = '';
+    const MAX_CHIPS = 36;
+    result.perChunk.slice(0, MAX_CHIPS).forEach((c, i) => {
+      const v = VERDICTS[verdictOf(c.pct)];
+      const chip = document.createElement('span');
+      chip.className = `inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 font-mono text-[11px] ${v.badge}`;
+      chip.title = `Section ${i + 1} · ${c.words.toLocaleString()} words · ${c.pct}% AI`;
+      chip.textContent = `S${i + 1} · ${c.pct}%`;
+      chunkBreakdown.appendChild(chip);
+    });
+    if (result.perChunk.length > MAX_CHIPS) {
+      const more = document.createElement('span');
+      more.className = 'inline-flex items-center rounded-md border border-white/10 bg-white/5 px-2.5 py-1 font-mono text-[11px] text-slate-400';
+      more.textContent = `+${(result.perChunk.length - MAX_CHIPS).toLocaleString()} more`;
+      chunkBreakdown.appendChild(more);
+    }
+  } else {
+    chunkBreakdownWrap.classList.add('hidden');
+  }
 }
+
+/* ----------------------------- Report export ------------------------------ */
+
+/** Build a Markdown report for the last analysis. */
+function buildReport(result) {
+  const v = VERDICTS[verdictOf(result.score)];
+  const lines = [
+    '# Sentinel AI — Analysis Report',
+    '',
+    `- Date: ${new Date().toLocaleString()}`,
+    `- Method: ${result.method === 'model' ? `Local model (${MODEL_ID}) via transformers.js` : 'Heuristic estimate (model not loaded)'}`,
+    `- Words: ${result.total.toLocaleString()} · Sentences: ${result.sentences.toLocaleString()} · Sections: ${result.perChunk ? result.perChunk.length : 'n/a'}`,
+    '',
+    `## Result — ${result.score}% AI Generated`,
+    '',
+    `**${v.title}**`,
+    '',
+    v.desc,
+    '',
+  ];
+  if (Array.isArray(result.perChunk) && result.perChunk.length) {
+    lines.push('## Section scores', '', '| Section | Words | AI % |', '| --- | --- | --- |');
+    result.perChunk.forEach((c, i) => lines.push(`| ${i + 1} | ${c.words.toLocaleString()} | ${c.pct}% |`));
+    lines.push('');
+  }
+  lines.push(
+    '## Signal breakdown',
+    '',
+    `- Phrase predictability: ${result.metrics[0]}%`,
+    `- Sentence uniformity: ${result.metrics[1]}%`,
+    `- Lexical repetition: ${result.metrics[2]}%`,
+    '',
+    '> Probabilistic screening only — not definitive proof of authorship.',
+  );
+  return lines.join('\n');
+}
+
+async function copyReport() {
+  if (!lastResult) return;
+  try {
+    await navigator.clipboard.writeText(buildReport(lastResult));
+    toast('Report copied to clipboard.', 'success');
+  } catch {
+    toast('Clipboard unavailable — use "Download .md" instead.', 'error');
+  }
+}
+
+function downloadReport() {
+  if (!lastResult) return;
+  const blob = new Blob([buildReport(lastResult)], { type: 'text/markdown' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `sentinel-ai-report-${new Date().toISOString().slice(0, 10)}.md`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  toast('Report downloaded (.md).', 'success');
+}
+
+copyReportBtn.addEventListener('click', copyReport);
+downloadReportBtn.addEventListener('click', downloadReport);
 
 /* ------------------------------ Orchestration ----------------------------- */
 
@@ -855,7 +970,7 @@ async function runAnalysis() {
     return;
   }
 
-  // 6) Show the results: AI percentage ring, headline and verdict.
+  // 6) Show the results: AI percentage ring, headline, verdict + breakdown.
   renderResult(result);
   progressWrap.classList.add('hidden');
   resultWrap.classList.remove('hidden');
@@ -878,6 +993,166 @@ document.addEventListener('keydown', (e) => {
     e.preventDefault();
     runAnalysis();
   }
+});
+
+/* ---------------------------------------------------------------------------
+ * Humanize — AI → Human rewrite (experimental, 100% local, free)
+ *
+ * Runs a small local LLM (TinyLlama 1.1B, q4-quantized ≈ 600 MB, one-time
+ * download) through transformers.js. WebGPU is used automatically when the
+ * browser exposes navigator.gpu; otherwise it falls back to CPU (slower).
+ * No cloud, no API key, no cost.
+ * ------------------------------------------------------------------------- */
+let rewriter = null;
+let rewriterReady = false;
+let rewriterLoading = false;
+let rewriteBusy = false;
+let rewriteCancelled = false;
+
+function setRewriteStatus(state, detail = '') {
+  const base = {
+    idle:    'Experimental · 100% local, free & private. First use downloads a small LLM (~600 MB, one-time).',
+    loading: 'Downloading rewriter model… ',
+    ready:   'Rewriter model ready (cached in your browser).',
+    busy:    '',
+    error:   'Error: ',
+  }[state];
+  rewriteStatus.textContent = base + detail;
+}
+
+async function loadRewriter() {
+  if (rewriter) return rewriter;
+  const transformers = await transformersPromise;
+  if (!transformers) throw new Error('The transformers.js CDN is unreachable.');
+  rewriterLoading = true;
+  try {
+    rewriter = await transformers.pipeline('text-generation', REWRITER_MODEL, {
+      dtype: 'q4', // browser-friendly quantization (use 'q8' for higher quality on desktops with RAM to spare)
+      progress_callback: (p) => {
+        if (p && p.file && p.status === 'progress' && p.progress != null) {
+          setRewriteStatus('loading', `${Math.round(p.progress)}% of ${p.file.split('/').pop()}`);
+        }
+      },
+    });
+    rewriterReady = true;
+    setRewriteStatus('ready');
+    return rewriter;
+  } finally {
+    rewriterLoading = false;
+  }
+}
+
+/** Build the chat prompt that asks the local LLM to humanize a chunk. */
+function buildRewritePrompt(chunk) {
+  return [
+    '<|system|>You rewrite text so it sounds natural, personal and human-written.',
+    '<|user|>Rewrite the passage below so a human wrote it. Keep the meaning and facts, vary sentence lengths, prefer simple words, and drop AI-cliché phrases (delve, moreover, landscape, testament, leverage, "in today\'s world"). Return only the rewritten passage, no commentary.',
+    chunk,
+    '<|assistant|>',
+  ].join('\n');
+}
+
+/** Strip role tags / stray whitespace from a generated reply. */
+function cleanRewrite(s) {
+  return String(s || '').replace(/<\|[^|]*\|>/g, '').trim();
+}
+
+async function humanizeText() {
+  const text = textarea.value.trim();
+  if (!text || rewriteBusy) return;
+
+  rewriteBusy = true;
+  rewriteCancelled = false;
+  rewriteOutput.value = '';
+  rewriteUseBtn.disabled = true;
+  rewriteCopyBtn.disabled = true;
+  rewriteDownloadBtn.disabled = true;
+  rewriteSection.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+  rewriteBtn.disabled = true;
+  rewriteCancelBtn.classList.remove('hidden');
+
+  try {
+    if (!rewriter) {
+      setRewriteStatus('loading', 'starting…');
+      await loadRewriter();
+    }
+
+    const chunks = chunkText(text, REWRITE_CHUNK_WORDS);
+    const parts = [];
+    for (let i = 0; i < chunks.length; i++) {
+      if (rewriteCancelled) break;
+      setRewriteStatus('busy', `Rewriting part ${i + 1} of ${chunks.length}… (WebGPU when available, CPU otherwise — CPU is slow)`);
+      await yieldToBrowser();
+
+      const out = await rewriter(buildRewritePrompt(chunks[i]), {
+        max_new_tokens: 512,
+        temperature: 0.7,
+        do_sample: true,
+        return_full_text: false,
+      });
+      parts.push(cleanRewrite(out));
+      rewriteOutput.value = parts.join('\n\n');
+      await yieldToBrowser();
+    }
+
+    setRewriteStatus('ready');
+    toast(
+      rewriteCancelled
+        ? 'Rewrite cancelled — partial output kept.'
+        : 'Rewrite complete. Tip: "Use in analyzer" to compare the new AI score.',
+      rewriteCancelled ? 'info' : 'success'
+    );
+  } catch (err) {
+    console.error('[Sentinel] Rewriter failed:', err);
+    setRewriteStatus('error', (err && err.message) || 'the rewriter model could not be loaded.');
+    toast('The rewriter model failed. See the Humanize panel for details.', 'error');
+  } finally {
+    rewriteBusy = false;
+    rewriteBtn.textContent = 'Humanize text';
+    rewriteCancelBtn.classList.add('hidden');
+    const hasOut = rewriteOutput.value.trim().length > 0;
+    rewriteUseBtn.disabled = !hasOut;
+    rewriteCopyBtn.disabled = !hasOut;
+    rewriteDownloadBtn.disabled = !hasOut;
+    updateStats(); // re-evaluate button enablement now that rewriteBusy is false
+  }
+}
+
+rewriteBtn.addEventListener('click', humanizeText);
+rewriteCancelBtn.addEventListener('click', () => {
+  if (rewriteBusy) rewriteCancelled = true;
+});
+
+// Load the rewritten text back into the analyzer (detect → humanize → re-detect loop).
+rewriteUseBtn.addEventListener('click', () => {
+  const out = rewriteOutput.value.trim();
+  if (!out) return;
+  textarea.value = out;
+  updateStats();
+  resultsSection.hidden = true;
+  toast('Rewritten text loaded — run Analyze to compare the AI score.', 'success');
+  textarea.scrollIntoView({ behavior: 'smooth', block: 'center' });
+});
+
+rewriteCopyBtn.addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(rewriteOutput.value);
+    toast('Rewritten text copied.', 'success');
+  } catch {
+    toast('Clipboard unavailable — select the text and copy manually.', 'error');
+  }
+});
+
+rewriteDownloadBtn.addEventListener('click', () => {
+  if (!rewriteOutput.value.trim()) return;
+  const blob = new Blob([rewriteOutput.value], { type: 'text/plain' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `sentinel-ai-rewrite-${new Date().toISOString().slice(0, 10)}.txt`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  toast('Rewrite downloaded (.txt).', 'success');
 });
 
 /* ---------------------------------------------------------------------------
@@ -910,10 +1185,5 @@ if (typeof pdfjsLib !== 'undefined') {
 }
 
 updateStats();
-initModel(); // starts the "Downloading AI Model…" flow on page load
-{
-  pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER;
-}
-
-updateStats();
+setRewriteStatus('idle');
 initModel(); // starts the "Downloading AI Model…" flow on page load

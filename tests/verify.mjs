@@ -43,7 +43,16 @@ function extractClass(name) {
 function extractConst(name) {
   const start = src.indexOf(`const ${name} =`);
   if (start === -1) throw new Error('not found: ' + name);
-  return src.slice(start, src.indexOf('\n];', start) + 3);
+  const endArr = src.indexOf('\n];', start);
+  const endObj = src.indexOf('\n};', start);
+  const end = endArr === -1 ? endObj : endObj === -1 ? endArr : Math.min(endArr, endObj);
+  return src.slice(start, end + 3);
+}
+
+function extractLine(name) {
+  const start = src.indexOf(`const ${name} =`);
+  if (start === -1) throw new Error('not found: ' + name);
+  return src.slice(start, src.indexOf('\n', start));
 }
 
 let passed = 0;
@@ -89,6 +98,8 @@ const template = [
   'function resetState() { classifierLog.length = 0; stubCalls = 0; cancelRequested = false; }',
   'function setScoreDefault(p) { for (const k of Object.keys(stubScores)) delete stubScores[k]; stubScores._default = p; }',
   extractConst('AI_PHRASES'),
+  extractLine('MODEL_ID'),
+  extractConst('VERDICTS'),
   'const computeScore = (text) => {',
   '  const words = (text.match(/\\S+/g) || []).length;',
   '  const sentences = text.split(/(?<=[.!?])\\s+/).map((s) => s.trim()).filter(Boolean).length;',
@@ -99,6 +110,8 @@ const template = [
   extractFunction('chunkText'),
   extractFunction('classifyChunks'),
   extractFunction('verdictOf'),
+  extractFunction('buildReport'),
+  extractFunction('buildRewritePrompt'),
   'const realComputeScore = (() => {',
   // real computeScore (for the discrimination test) — eval in this scope:
   extractFunction('computeScore').replace(/^function computeScore/, 'function _cs'),
@@ -108,7 +121,8 @@ const template = [
   'function setCancelAfter(n) { cancelAfter = n; }',
   'export { chunkText, classifyChunks, chunkAiProbability, isFakeLabel, verdictOf,',
   '         AnalysisCancelled, classifierLog, stubScores, wc,',
-  '         setCancel, setCancelAfter, resetState, setScoreDefault, realComputeScore };',
+  '         setCancel, setCancelAfter, resetState, setScoreDefault, realComputeScore,',
+  '         buildReport, buildRewritePrompt };',
 ].join('\n');
 
 // The real computeScore uses a local name; keep the stub for classifyChunks.
@@ -267,6 +281,33 @@ await timed('classifyChunks 50k words (stubbed model, 167 chunks)', async () => 
 const rBig = await core.classifyChunks(bigChunks, big);
 check('50k words -> 167 chunks', bigChunks.length === 167, `got ${bigChunks.length}`);
 check('50k words @ 0.9 -> 90% -> ai', rBig.score === 90 && core.verdictOf(rBig.score) === 'ai', `score ${rBig.score}`);
+
+/* ---------- 8. Per-section scores, report, rewrite prompt ---------- */
+
+console.log('\n[8] Per-section scores + report + rewrite prompt');
+
+core.resetState();
+core.setScoreDefault(0.8);
+const r8 = await core.classifyChunks([A, B], A + ' ' + B);
+check('perChunk has one entry per chunk', r8.perChunk.length === 2, `got ${r8.perChunk.length}`);
+check(
+  'perChunk pct+words correct',
+  r8.perChunk[0].pct === 80 && r8.perChunk[0].words === 300 && r8.perChunk[1].pct === 80 && r8.perChunk[1].words === 100,
+  JSON.stringify(r8.perChunk)
+);
+
+const report = core.buildReport({ score: 85, metrics: [70, 60, 30], total: 2200, sentences: 200, method: 'model', perChunk: r8.perChunk });
+check('report has headline', report.includes('85% AI Generated'));
+check('report has verdict title', report.includes('Highly Likely AI-Generated'));
+check('report has model id', report.includes('Xenova/roberta-base-openai-detector'));
+check('report has section table rows', report.includes('| 1 | 300 | 80% |'));
+check('report has disclaimer', report.includes('Probabilistic screening'));
+check('report works without perChunk', core.buildReport({ score: 10, metrics: [5, 20, 30], total: 500, sentences: 40, method: 'heuristic' }).includes('Heuristic estimate'));
+
+const prompt = core.buildRewritePrompt('The quick brown fox. More testing here.');
+check('rewrite prompt contains the chunk', prompt.includes('The quick brown fox. More testing here.'));
+check('rewrite prompt asks for human style', prompt.toLowerCase().includes('human'));
+check('rewrite prompt ends with <|assistant|>', prompt.trimEnd().endsWith('<|assistant|>'));
 
 /* ---------- summary ---------- */
 

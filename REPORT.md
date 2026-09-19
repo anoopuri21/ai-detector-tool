@@ -127,3 +127,41 @@ The sandbox has **no internet access**, so: the actual model download, real ONNX
 ```bash
 node tests/verify.mjs   # dev-only; the app itself needs no Node.js
 ```
+
+---
+
+## 9. Power-up pass 2 (same day) — free upgrades + AI→Human rewrite
+
+### 9.1 Bug found & fixed during this pass (important)
+
+A previous edit had silently corrupted `script.js`: the file tail was duplicated (`initModel()` would run **twice** → double model downloads on load) and two constants (`LARGE_CHUNKS_HINT`, `MAX_CHUNKS_WITHOUT_CONFIRM`) were missing → a `ReferenceError` would crash model analysis at runtime. Syntax checks don't catch missing identifiers, so a full file audit was done; `script.js` was rebuilt clean and re-verified (51/51 checks).
+
+### 9.2 "Make it more powerful, free" — implemented
+
+| Feature | What it does |
+|---|---|
+| **Section breakdown** | After a model run, colored chips (`S1 · 92%`, `S2 · 41%`, …) show the AI score **per section** — you see *where* the AI signal concentrates, not just the aggregate. Tooltip shows words per section. |
+| **Report export** | **Copy report** (clipboard) and **Download .md** — full Markdown report: date, method, score, verdict, per-section table, signal breakdown, disclaimer. |
+| **Humanize (AI→Human)** | New panel: a small local LLM (`Xenova/tinyllama-1.1b-chat-v0.3`, q4 ≈ 600 MB, one-time download, **free, no API key, 100% local**) rewrites the textarea content chunk-by-chunk. Progress, Cancel, Copy, Download .txt, and **"Use in analyzer"** for the detect → humanize → re-detect score-comparison loop. WebGPU is used automatically when the browser supports it; CPU fallback is slow (stated in the UI). |
+
+### 9.3 Honest limits of the free humanizer
+
+- Quality is bounded by a 1.1B-parameter model — it produces a usable **first draft** of a more human-sounding version, not a GPT-4-grade rewrite. The re-analyze loop lets you verify the AI score actually drops.
+- First use downloads ~600 MB (one-time, then cached). CPU-only browsers: expect minutes per 250-word chunk.
+
+### 9.4 Updated improvement plan
+
+**Done this pass:** per-section scores · report export · local humanizer · bug fix.
+
+**Phase 2 (next):**
+1. **Better detector** — evaluate newer/finetuned free detectors (HF) on a modern AI-vs-human corpus; swap via the `MODEL_ID` constant + eval harness.
+2. **Tesseract.js OCR** — make scanned PDFs readable (free, in-browser, ~4 MB eng data).
+3. **Host model files on Cloudflare R2** (free tier) so visitors in regions that block HuggingFace can still load models; point transformers.js at the R2 URLs.
+4. **Pre-compiled Tailwind CSS** + CSP headers at the host.
+5. Rewrite quality boosters: `q8` dtype option toggle, temperature/max-tokens sliders, per-chunk "keep original" choice.
+
+**Phase 3:** ensemble detection (2 models + disagreement flag) · multilingual · PDF report export (jsPDF) · i18n · optional hosted API for heavy workloads · Sentry (no content sent).
+
+### 9.5 Verification (this pass)
+
+`node tests/verify.mjs` → **51 passed, 0 failed** — including new checks: per-section score data, report content (headline/verdict/model/table/disclaimer), and rewrite-prompt construction. All 57 DOM ids cross-checked against the HTML.
