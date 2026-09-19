@@ -71,6 +71,7 @@ const resultMethod   = $('resultMethod');
 
 const aiRing       = $('aiRing');
 const aiPercent    = $('aiPercent');
+const aiHeadline   = $('aiHeadline');
 const verdictBadge = $('verdictBadge');
 const verdictDot   = $('verdictDot');
 const verdictTitle = $('verdictTitle');
@@ -94,6 +95,9 @@ const toastContainer = $('toastContainer');
  * ------------------------------------------------------------------------- */
 const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
 const extOf = (name) => (name.split('.').pop() || '').toLowerCase();
+// Let the browser paint (spinner, labels, progress bar) before the next chunk's
+// inference blocks the main thread — keeps the UI responsive, never frozen.
+const yieldToBrowser = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 /** Toast notifications (bottom-right stack). */
 function toast(message, type = 'info') {
@@ -535,44 +539,64 @@ function animateProgress() {
 
 /* -------------------------- Model-based analysis ------------------------- */
 
-/** True when a model label denotes AI/machine-generated text. */
-function isAILabel(label) {
+/**
+ * True when a model label denotes AI / fake-generated text.
+ * This model's label convention: LABEL_0 = "Real" (human), LABEL_1 = "Fake" (AI).
+ */
+function isFakeLabel(label) {
   const l = String(label || '').toLowerCase();
-  if (l === 'label_1') return true;  // detector convention: LABEL_0 = human, LABEL_1 = AI
+  if (l === 'label_1') return true;
   if (l === 'label_0') return false;
-  if (/(^|[^a-z])(ai|artificial|machine|generated|synthetic)([^a-z]|$)/.test(l)) return true;
-  if (/human|authentic|organic/.test(l)) return false;
+  if (/(fake|ai|artificial|machine|generated|synthetic)/.test(l)) return true;
+  if (/(real|human|authentic|organic)/.test(l)) return false;
   return false; // unknown label: conservatively treat as human
 }
 
-/** Convert a chunk's classification output into an AI probability (0–1). */
+/**
+ * Extract the probability of the Fake/AI label for one chunk.
+ * @param {Array<{label: string, score: number}>} classification
+ *        pipeline output (top_k results, sorted by descending score)
+ * @returns {number} probability that the chunk is AI-generated, 0–1
+ */
 function chunkAiProbability(classification) {
-  const top = (classification && classification[0]) || { label: 'label_0', score: 0.5 };
-  return isAILabel(top.label) ? top.score : 1 - top.score;
+  if (!classification || !classification.length) return 0.5;
+  // Preferred: the explicit Fake/AI label and its score.
+  const fake = classification.find((item) => isFakeLabel(item.label));
+  if (fake) return fake.score;
+  // Fallback: only the Real/Human label came back — invert its score.
+  return 1 - classification[0].score;
 }
 
 /**
- * Classify the full text with the local model, chunk by chunk.
- * Updates the progress bar/label as each chunk is processed.
+ * Classify each chunk with the local model and combine the results.
+ * The final score is a WORD-WEIGHTED average of the per-chunk Fake/AI
+ * probabilities, so a partial (shorter) final chunk contributes less.
+ *
+ * @param {string[]} chunks   output of chunkText()
+ * @param {string} text       full original text (for supporting metrics)
+ * @param {(done: number, total: number) => void} [onChunk]
+ *        called after every chunk — drives "Analyzing… i/X chunks" + progress bar
  */
-async function runModelAnalysis(text) {
-  const chunks = chunkText(text);
-  let aiSum = 0;
+async function classifyChunks(chunks, text, onChunk) {
+  const weights = chunks.map((c) => (c.match(/\S+/g) || []).length || 1);
+  let weightedSum = 0;
+  let totalWeight = 0;
 
   for (let i = 0; i < chunks.length; i++) {
-    progressBar.style.width = Math.round((i / chunks.length) * 100) + '%';
-    progressLabel.textContent =
-      chunks.length === 1
-        ? 'Running AI detection…'
-        : `Classifying section ${i + 1} of ${chunks.length}…`;
+    // Paint the current state before this chunk's (synchronous) inference.
+    await yieldToBrowser();
 
-    const result = await classifier(chunks[i], { top_k: 2 });
-    aiSum += chunkAiProbability(result);
+    const fakeProbability = chunkAiProbability(await classifier(chunks[i], { top_k: 2 }));
 
-    progressBar.style.width = Math.round(((i + 1) / chunks.length) * 100) + '%';
+    weightedSum += fakeProbability * weights[i];
+    totalWeight += weights[i];
+
+    if (onChunk) onChunk(i + 1, chunks.length);
+    await yieldToBrowser();
   }
 
-  const score = clamp(Math.round((aiSum / chunks.length) * 100), 2, 98);
+  // Weighted average -> final "AI Percentage" (0–100).
+  const score = clamp(Math.round((weightedSum / totalWeight) * 100), 2, 98);
   const supporting = computeScore(text); // heuristic metrics, shown as signal bars
   return {
     score,
@@ -644,33 +668,33 @@ function computeScore(text) {
 /* ------------------------------- Verdicts --------------------------------- */
 
 const VERDICTS = {
-  ai: {
-    title: 'Likely AI-generated',
-    desc: 'The model assigns a high probability of machine-generated text to this content. Treat it as AI-written until a human confirms otherwise.',
-    color: '#fb7185',
-    badge: 'border-rose-500/40 bg-rose-500/10 text-rose-300',
-    dot: 'bg-rose-400',
-  },
-  mixed: {
-    title: 'Mixed signals',
-    desc: 'This content shows a moderate probability of AI generation. It may be partly machine-written — or AI text that has been heavily edited by a human.',
-    color: '#fbbf24',
-    badge: 'border-amber-500/40 bg-amber-500/10 text-amber-300',
-    dot: 'bg-amber-400',
-  },
   human: {
-    title: 'Likely human-written',
-    desc: 'The model assigns a low probability of machine-generated text to this content. No strong machine-writing signals were detected in this sample.',
+    title: 'Likely Human-Written',
+    desc: 'The model assigns a low probability of machine-generated text to this content (0–20%). It reads as naturally human.',
     color: '#34d399',
     badge: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300',
     dot: 'bg-emerald-400',
   },
+  mixed: {
+    title: 'Mixed Content',
+    desc: 'The model shows a moderate probability of machine-generated text (21–79%). The content may be partly AI-written, or AI text that has been edited by a human.',
+    color: '#fbbf24',
+    badge: 'border-amber-500/40 bg-amber-500/10 text-amber-300',
+    dot: 'bg-amber-400',
+  },
+  ai: {
+    title: 'Highly Likely AI-Generated',
+    desc: 'The model assigns a high probability of machine-generated text to this content (80–100%). Treat it as AI-written until a human confirms otherwise.',
+    color: '#fb7185',
+    badge: 'border-rose-500/40 bg-rose-500/10 text-rose-300',
+    dot: 'bg-rose-400',
+  },
 };
 
 function verdictOf(score) {
-  if (score >= 65) return 'ai';
-  if (score >= 35) return 'mixed';
-  return 'human';
+  if (score >= 80) return 'ai';    // 80–100%
+  if (score > 20) return 'mixed';  // 21–79%
+  return 'human';                  // 0–20%
 }
 
 function animateNumber(el, target, duration, onStep) {
@@ -695,6 +719,7 @@ function renderResult(result) {
   verdictDot.className = 'h-2 w-2 rounded-full ' + spec.dot;
   verdictTitle.textContent = spec.title;
   verdictDesc.textContent = spec.desc;
+  aiHeadline.textContent = `${result.score}% AI Generated`;
   wordCountLn.textContent =
     `${result.total.toLocaleString()} words · ${result.sentences.toLocaleString()} sentences analyzed`;
   resultMethod.textContent =
@@ -720,6 +745,11 @@ function renderResult(result) {
 
 /* ------------------------------ Orchestration ----------------------------- */
 
+/** Button label while analyzing: "Analyzing… i/X chunks" (spinner is shown by CSS). */
+function setButtonProgress(total, done) {
+  analyzeLabel.textContent = `Analyzing… ${done}/${total} chunks`;
+}
+
 async function runAnalysis() {
   const text = textarea.value.trim();
   if (!text || isAnalyzing) return;
@@ -739,7 +769,20 @@ async function runAnalysis() {
   let result;
   if (modelReady && classifier) {
     try {
-      result = await runModelAnalysis(text);
+      // 1) Take the textarea text and run it through the chunking function.
+      const chunks = chunkText(text);
+
+      // 2) Button: spinner + "Analyzing… 0/X chunks".
+      setButtonProgress(chunks.length, 0);
+
+      // 3–5) Classify every chunk with the pipeline and combine the
+      //      per-chunk Fake/AI probabilities into one weighted average.
+      result = await classifyChunks(chunks, text, (done, total) => {
+        setButtonProgress(total, done);
+        progressBar.style.width = Math.round((done / total) * 100) + '%';
+        progressLabel.textContent =
+          total === 1 ? 'Running AI detection…' : `Classifying section ${done} of ${total}…`;
+      });
     } catch (err) {
       console.error('[Sentinel] Model inference failed:', err);
       toast('The AI model failed during analysis — falling back to the built-in heuristic.', 'error');
@@ -754,6 +797,7 @@ async function runAnalysis() {
     result = { ...computeScore(text), method: 'heuristic' };
   }
 
+  // 6) Show the results: AI percentage ring, headline and verdict.
   renderResult(result);
   progressWrap.classList.add('hidden');
   resultWrap.classList.remove('hidden');
