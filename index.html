@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sentinel AI — AI Content Detector</title>
+  <meta name="description" content="Detect AI-generated content instantly. Paste text or upload PDF, DOCX, TXT or MD files — analyzed 100% in your browser." />
+
+  <!-- Favicon -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%238b5cf6'/%3E%3Cstop offset='1' stop-color='%2322d3ee'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='8' fill='url(%23g)'/%3E%3Cpath d='M16 7l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9v-6l7-3z' fill='white' fill-opacity='.92'/%3E%3Cpath d='M12.5 16.5l2.5 2.5 4.5-5' stroke='%238b5cf6' stroke-width='2' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+  <!-- Tailwind (CDN) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+            mono: ['"JetBrains Mono"', 'ui-monospace', 'monospace'],
+          },
+          colors: {
+            ink: { 950: '#060913', 900: '#0b1020', 800: '#111831', 700: '#1a2342' },
+          },
+        },
+      },
+    };
+  </script>
+
+  <!-- Document parsing engines (CDN) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+
+  <style>
+    body { background-color: #060913; }
+
+    /* Ambient background glow */
+    .bg-glow {
+      position: fixed; inset: 0; z-index: -2; overflow: hidden; pointer-events: none;
+      background:
+        radial-gradient(600px 400px at 15% -5%, rgba(139, 92, 246, 0.16), transparent 70%),
+        radial-gradient(700px 500px at 90% 0%, rgba(34, 211, 238, 0.10), transparent 70%),
+        radial-gradient(900px 600px at 50% 110%, rgba(99, 102, 241, 0.10), transparent 70%);
+    }
+    .bg-grid {
+      position: fixed; inset: 0; z-index: -1; pointer-events: none; opacity: .5;
+      background-image:
+        linear-gradient(rgba(148, 163, 184, 0.045) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(148, 163, 184, 0.045) 1px, transparent 1px);
+      background-size: 44px 44px;
+      mask-image: radial-gradient(ellipse 90% 60% at 50% 0%, black 30%, transparent 75%);
+      -webkit-mask-image: radial-gradient(ellipse 90% 60% at 50% 0%, black 30%, transparent 75%);
+    }
+
+    /* Textarea */
+    #textInput { scrollbar-width: thin; scrollbar-color: #334155 transparent; }
+    #textInput::-webkit-scrollbar { width: 10px; }
+    #textInput::-webkit-scrollbar-thumb { background: #27324d; border-radius: 8px; border: 2px solid #0b1020; }
+    #textInput::-webkit-scrollbar-track { background: transparent; }
+
+    /* Dropzone drag state */
+    #dropzone.drag-over { border-color: rgba(139, 92, 246, 0.7); background: rgba(139, 92, 246, 0.08); transform: scale(1.005); }
+
+    /* AI-score ring (driven by --p: 0–100 and --ring-color) */
+    #aiRing {
+      background: conic-gradient(var(--ring-color, #a78bfa) calc(var(--p, 0) * 1%), rgba(255, 255, 255, 0.07) 0);
+    }
+
+    /* Progress bar shimmer */
+    #progressBar {
+      background: linear-gradient(90deg, #8b5cf6, #22d3ee, #8b5cf6);
+      background-size: 200% 100%;
+      animation: shimmer 1.2s linear infinite;
+    }
+    @keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+
+    /* Toasts */
+    @keyframes toast-in { from { opacity: 0; transform: translateY(12px) scale(.97); } to { opacity: 1; transform: translateY(0) scale(1); } }
+    @keyframes toast-out { to { opacity: 0; transform: translateY(8px) scale(.97); } }
+    .toast { animation: toast-in .25s ease-out both; }
+    .toast.leaving { animation: toast-out .3s ease-in both; }
+
+    /* Result reveal */
+    @keyframes rise { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
+    .rise-in { animation: rise .45s cubic-bezier(.22, 1, .36, 1) both; }
+  </style>
+</head>
+
+<body class="min-h-screen font-sans text-slate-300 antialiased selection:bg-violet-500/30 selection:text-white">
+  <div class="bg-glow"></div>
+  <div class="bg-grid"></div>
+
+  <!-- ============ NAVBAR ============ -->
+  <header class="sticky top-0 z-40 border-b border-white/5 bg-ink-950/70 backdrop-blur-xl">
+    <nav class="mx-auto flex h-16 max-w-6xl items-center justify-between px-4 sm:px-6">
+      <a href="#" class="flex items-center gap-2.5">
+        <span class="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-violet-500 to-cyan-400 shadow-lg shadow-violet-500/30">
+          <svg class="h-5 w-5 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6l7-3z"/>
+            <path d="M9 12l2 2 4-4"/>
+          </svg>
+        </span>
+        <span class="text-lg font-bold tracking-tight text-white">Sentinel<span class="bg-gradient-to-r from-violet-400 to-cyan-300 bg-clip-text text-transparent"> AI</span></span>
+      </a>
+
+      <div class="hidden items-center gap-8 text-sm font-medium text-slate-400 md:flex">
+        <a href="#detector" class="transition hover:text-white">Detector</a>
+        <a href="#how" class="transition hover:text-white">How it works</a>
+        <a href="#privacy" class="transition hover:text-white">Privacy</a>
+      </div>
+
+      <div class="flex items-center gap-3">
+        <button class="hidden rounded-lg px-4 py-2 text-sm font-medium text-slate-300 transition hover:text-white sm:block">Sign in</button>
+        <a href="#detector" class="rounded-lg bg-gradient-to-r from-violet-500 to-cyan-400 px-4 py-2 text-sm font-semibold text-slate-950 shadow-lg shadow-violet-500/25 transition hover:from-violet-400 hover:to-cyan-300">
+          Get started
+        </a>
+      </div>
+    </nav>
+  </header>
+
+  <main class="mx-auto max-w-6xl px-4 pb-24 sm:px-6">
+
+    <!-- ============ HERO ============ -->
+    <section class="pt-14 pb-10 text-center sm:pt-20">
+      <div class="mx-auto mb-5 inline-flex items-center gap-2 rounded-full border border-violet-500/30 bg-violet-500/10 px-4 py-1.5 text-xs font-semibold text-violet-300">
+        <span class="relative flex h-2 w-2">
+          <span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-violet-400 opacity-60"></span>
+          <span class="relative inline-flex h-2 w-2 rounded-full bg-violet-400"></span>
+        </span>
+        v2.0 — now parses PDF, DOCX, TXT &amp; MD
+      </div>
+      <h1 class="mx-auto max-w-3xl text-4xl font-extrabold tracking-tight text-white sm:text-5xl lg:text-6xl">
+        Spot <span class="bg-gradient-to-r from-violet-400 via-fuchsia-400 to-cyan-300 bg-clip-text text-transparent">AI-written</span> content at a glance
+      </h1>
+      <p class="mx-auto mt-5 max-w-2xl text-base leading-relaxed text-slate-400 sm:text-lg">
+        Paste a draft or drop a whole document. Sentinel analyzes it locally in your browser —
+        no uploads, no accounts, no data ever leaves your machine.
+      </p>
+    </section>
+
+    <!-- ============ DETECTOR DASHBOARD ============ -->
+    <section id="detector" class="mx-auto max-w-4xl scroll-mt-24">
+
+      <!-- AI model status (visible on page load until the model is downloaded / cached) -->
+      <div id="modelStatus" class="mb-6 flex items-center gap-4 rounded-xl border border-amber-500/30 bg-amber-500/10 px-5 py-4 backdrop-blur-xl transition-opacity duration-300">
+        <span id="modelStatusIcon" class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-amber-500/15 text-amber-300">
+          <svg class="h-5 w-5 animate-spin" viewBox="0 0 24 24" fill="none">
+            <circle class="opacity-20" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3"/>
+            <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+          </svg>
+        </span>
+        <div class="min-w-0 flex-1">
+          <p id="modelStatusTitle" class="text-sm font-semibold text-amber-200">Downloading AI Model…</p>
+          <p id="modelStatusSub" class="mt-0.5 truncate text-xs text-amber-200/60">(This may take a minute on first load)</p>
+        </div>
+        <span id="modelStatusPct" class="font-mono text-sm font-semibold tabular-nums text-amber-200/80">—</span>
+        <button id="modelRetryBtn" class="hidden rounded-lg border border-rose-500/40 bg-rose-500/10 px-3.5 py-1.5 text-xs font-bold text-rose-200 transition hover:bg-rose-500/20">Retry</button>
+      </div>
+
+      <div class="rounded-2xl border border-white/10 bg-ink-900/70 shadow-[0_0_80px_-20px_rgba(139,92,246,0.35)] backdrop-blur-xl">
+
+        <!-- Card header -->
+        <div class="flex flex-col gap-4 border-b border-white/5 px-6 py-5 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h2 class="text-lg font-semibold text-white">Document Analyzer</h2>
+            <p class="mt-0.5 text-sm text-slate-400">Paste text or upload a file to begin.</p>
+          </div>
+          <div class="flex items-center gap-3">
+            <div class="hidden items-center gap-1.5 sm:flex">
+              <span class="rounded-md border border-white/10 bg-white/5 px-2 py-1 font-mono text-[11px] text-slate-400">.pdf</span>
+              <span class="rounded-md border border-white/10 bg-white/5 px-2 py-1 font-mono text-[11px] text-slate-400">.docx</span>
+              <span class="rounded-md border border-white/10 bg-white/5 px-2 py-1 font-mono text-[11px] text-slate-400">.txt</span>
+              <span class="rounded-md border border-white/10 bg-white/5 px-2 py-1 font-mono text-[11px] text-slate-400">.md</span>
+            </div>
+            <input id="fileInput" type="file" accept=".pdf,.docx,.txt,.md" class="hidden" />
+            <button id="uploadBtn" class="inline-flex items-center gap-2 rounded-lg border border-violet-500/40 bg-violet-500/10 px-4 py-2 text-sm font-semibold text-violet-200 transition hover:border-violet-400/60 hover:bg-violet-500/20">
+              <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <path d="M17 8l-5-5-5 5"/>
+                <path d="M12 3v12"/>
+              </svg>
+              Upload document
+            </button>
+          </div>
+        </div>
+
+        <div class="px-6 py-6">
+
+          <!-- Dropzone -->
+          <div id="dropzone" role="button" tabindex="0" aria-label="Upload a document by dragging and dropping or clicking"
+               class="group flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-white/15 bg-white/[0.02] px-6 py-8 text-center transition duration-200 hover:border-violet-500/50 hover:bg-violet-500/5">
+            <div id="dropIcon" class="flex h-12 w-12 items-center justify-center rounded-full border border-white/10 bg-white/5 text-slate-400 transition group-hover:text-violet-300">
+              <svg class="h-6 w-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <path d="M14 2v6h6"/>
+                <path d="M12 18v-6"/>
+                <path d="M9 15l3 3 3-3"/>
+              </svg>
+            </div>
+            <div id="dropLoading" class="hidden flex-col items-center py-1">
+              <svg class="h-8 w-8 animate-spin text-violet-400" viewBox="0 0 24 24" fill="none">
+                <circle class="opacity-20" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3"/>
+                <path class="opacity-90" d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+              </svg>
+              <p class="mt-3 text-sm font-medium text-violet-200" id="dropLoadingLabel">Reading file…</p>
+            </div>
+            <p id="dropTitle" class="mt-3 text-sm font-semibold text-slate-200">Drag &amp; drop your document here</p>
+            <p id="dropSub" class="mt-1 text-xs text-slate-500">or click to browse — PDF, DOCX, TXT, MD (max 25&nbsp;MB)</p>
+          </div>
+
+          <!-- Textarea -->
+          <label for="textInput" class="mt-6 flex items-center justify-between text-sm font-medium text-slate-300">
+            <span>Text to analyze</span>
+            <span class="text-xs font-normal text-slate-500">you can also paste (Ctrl/⌘+V)</span>
+          </label>
+          <textarea id="textInput" rows="12" spellcheck="false"
+            placeholder="Paste the text you want to check here… essays, blog posts, emails, reports — the longer the sample, the more reliable the verdict."
+            class="mt-2 h-72 w-full resize-y rounded-xl border border-white/10 bg-ink-950/80 p-4 font-mono text-sm leading-relaxed text-slate-200 placeholder:text-slate-600 focus:border-violet-500/60 focus:outline-none focus:ring-2 focus:ring-violet-500/30"></textarea>
+
+          <!-- Live stats -->
+          <div class="mt-3 flex flex-wrap items-center gap-x-5 gap-y-1 text-xs text-slate-500">
+            <span class="inline-flex items-center gap-1.5">
+              <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7V4h16v3"/><path d="M9 20h6"/><path d="M12 4v16"/></svg>
+              <span id="statWords" class="tabular-nums">0 words</span>
+            </span>
+            <span id="statChars" class="tabular-nums">0 chars</span>
+            <span id="statRead">—</span>
+            <span class="ml-auto inline-flex items-center gap-1.5 text-emerald-400/80">
+              <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+              100% client-side
+            </span>
+          </div>
+
+          <!-- Actions -->
+          <div class="mt-6 flex flex-col gap-3 sm:flex-row sm:items-center">
+            <button id="analyzeBtn" disabled
+              class="inline-flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-violet-500 to-cyan-400 px-8 py-3.5 text-base font-bold text-slate-950 shadow-lg shadow-violet-500/30 transition hover:from-violet-400 hover:to-cyan-300 hover:shadow-violet-500/50 disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none disabled:hover:from-violet-500 disabled:hover:to-cyan-400">
+              <svg id="analyzeSpinner" class="hidden h-5 w-5 animate-spin" viewBox="0 0 24 24" fill="none">
+                <circle class="opacity-30" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3"/>
+                <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+              </svg>
+              <svg id="analyzeIcon" class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 3l1.9 5.7L19.6 10l-5.7 1.9L12 17.6l-1.9-5.7L4.4 10l5.7-1.9z"/>
+                <path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/>
+              </svg>
+              <span id="analyzeLabel">Analyze Content</span>
+            </button>
+            <button id="clearBtn"
+              class="inline-flex items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/5 px-6 py-3.5 text-sm font-semibold text-slate-300 transition hover:border-white/20 hover:bg-white/10 hover:text-white">
+              <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18"/><path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
+              Clear
+            </button>
+            <button id="cancelBtn"
+              class="hidden inline-flex items-center justify-center gap-2 rounded-xl border border-rose-500/40 bg-rose-500/10 px-6 py-3.5 text-sm font-semibold text-rose-300 transition hover:bg-rose-500/20">
+              <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+              Cancel
+            </button>
+            <span class="hidden text-xs text-slate-600 sm:block">Tip: Ctrl/⌘ + Enter also runs the analysis</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============ RESULTS (hidden until analysis) ============ -->
+      <section id="resultsSection" hidden class="mt-8">
+        <div class="rounded-2xl border border-white/10 bg-ink-900/70 shadow-2xl backdrop-blur-xl">
+
+          <div class="flex flex-wrap items-center justify-between gap-3 border-b border-white/5 px-6 py-5">
+            <div class="flex items-center gap-3">
+              <span class="flex h-9 w-9 items-center justify-center rounded-lg border border-white/10 bg-white/5 text-violet-300">
+                <svg class="h-4.5 w-4.5" style="width:1.1rem;height:1.1rem" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M3 3v18h18"/>
+                  <path d="M7 14l4-4 3 3 5-6"/>
+                </svg>
+              </span>
+              <div>
+                <h3 class="text-base font-semibold text-white">Analysis results</h3>
+                <p id="resultMethod" class="text-xs text-slate-500">Heuristic estimate — computed locally in your browser</p>
+              </div>
+            </div>
+            <div class="flex items-center gap-2">
+              <button id="copyReportBtn" class="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-semibold text-slate-300 transition hover:border-white/20 hover:bg-white/10 hover:text-white">Copy report</button>
+              <button id="downloadReportBtn" class="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-semibold text-slate-300 transition hover:border-white/20 hover:bg-white/10 hover:text-white">Download .md</button>
+              <span id="wordCountLine" class="hidden text-xs text-slate-500 md:block"></span>
+            </div>
+          </div>
+
+          <!-- Progress state -->
+          <div id="progressWrap" class="px-6 py-12">
+            <div class="mx-auto max-w-xl text-center">
+              <p id="progressLabel" class="text-sm font-medium text-slate-300">Tokenizing document…</p>
+              <div class="mt-5 h-3 w-full overflow-hidden rounded-full bg-white/5">
+                <div id="progressBar" class="h-full w-0 rounded-full transition-[width] duration-150 ease-out"></div>
+              </div>
+              <p class="mt-3 text-xs text-slate-500">This usually takes a couple of seconds.</p>
+            </div>
+          </div>
+
+          <!-- Result state -->
+          <div id="resultWrap" class="hidden px-6 py-8">
+            <div class="rise-in flex flex-col items-center gap-8 sm:flex-row sm:gap-12">
+
+              <!-- AI score ring -->
+              <div class="flex flex-col items-center">
+                <div class="relative h-44 w-44">
+                  <div id="aiRing" class="absolute inset-0 rounded-full" style="--p:0; --ring-color:#a78bfa"></div>
+                  <div class="absolute inset-[13px] flex flex-col items-center justify-center rounded-full border border-white/5 bg-ink-900">
+                    <span id="aiPercent" class="text-4xl font-extrabold tabular-nums text-white">0%</span>
+                    <span class="mt-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-500">AI probability</span>
+                  </div>
+                </div>
+                <p class="mt-3 text-xs text-slate-500">0% = fully human · 100% = fully AI</p>
+              </div>
+
+              <!-- Verdict + metrics -->
+              <div class="w-full flex-1">
+                <h4 id="aiHeadline" class="text-3xl font-extrabold tracking-tight text-white sm:text-4xl">—</h4>
+                <div class="mt-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-4">
+                  <div id="verdictBadge" class="inline-flex items-center gap-2 self-start rounded-full border border-slate-500/40 bg-slate-500/10 px-4 py-1.5 text-sm font-bold text-slate-200">
+                    <span id="verdictDot" class="h-2 w-2 rounded-full bg-slate-400"></span>
+                    <span id="verdictTitle">Analyzing…</span>
+                  </div>
+                </div>
+                <p id="verdictDesc" class="mt-3 text-sm leading-relaxed text-slate-400">Running the analysis…</p>
+
+                <div class="mt-7 space-y-5">
+                  <div>
+                    <div class="mb-1.5 flex items-center justify-between text-sm">
+                      <span class="font-medium text-slate-300">Phrase predictability</span>
+                      <span id="metric1Val" class="tabular-nums text-slate-400">0%</span>
+                    </div>
+                    <div class="h-2 overflow-hidden rounded-full bg-white/5">
+                      <div id="metric1Bar" class="h-full w-0 rounded-full bg-gradient-to-r from-violet-500 to-cyan-400 transition-all duration-700 ease-out"></div>
+                    </div>
+                    <p class="mt-1 text-xs text-slate-600">How often the text uses formulaic, LLM-typical phrasing.</p>
+                  </div>
+                  <div>
+                    <div class="mb-1.5 flex items-center justify-between text-sm">
+                      <span class="font-medium text-slate-300">Sentence uniformity</span>
+                      <span id="metric2Val" class="tabular-nums text-slate-400">0%</span>
+                    </div>
+                    <div class="h-2 overflow-hidden rounded-full bg-white/5">
+                      <div id="metric2Bar" class="h-full w-0 rounded-full bg-gradient-to-r from-violet-500 to-cyan-400 transition-all duration-700 ease-out"></div>
+                    </div>
+                    <p class="mt-1 text-xs text-slate-600">AI text tends to have very even sentence lengths.</p>
+                  </div>
+                  <div>
+                    <div class="mb-1.5 flex items-center justify-between text-sm">
+                      <span class="font-medium text-slate-300">Lexical repetition</span>
+                      <span id="metric3Val" class="tabular-nums text-slate-400">0%</span>
+                    </div>
+                    <div class="h-2 overflow-hidden rounded-full bg-white/5">
+                      <div id="metric3Bar" class="h-full w-0 rounded-full bg-gradient-to-r from-violet-500 to-cyan-400 transition-all duration-700 ease-out"></div>
+                    </div>
+                    <p class="mt-1 text-xs text-slate-600">Low word variety is a common machine-writing signal.</p>
+                  </div>
+                </div>
+
+                <!-- Per-section AI scores (model runs only) -->
+                <div id="chunkBreakdownWrap" class="mt-7 hidden">
+                  <h5 class="text-sm font-medium text-slate-300">Section breakdown</h5>
+                  <p class="mt-0.5 text-xs text-slate-600">AI score per section — hover a chip for details.</p>
+                  <div id="chunkBreakdown" class="mt-3 flex flex-wrap gap-2"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ HUMANIZE (AI → Human rewrite, experimental) ============ -->
+      <section id="rewriteSection" class="mt-8">
+        <div class="rounded-2xl border border-white/10 bg-ink-900/70 shadow-2xl backdrop-blur-xl">
+
+          <div class="border-b border-white/5 px-6 py-5">
+            <div class="flex items-center gap-3">
+              <span class="flex h-9 w-9 items-center justify-center rounded-lg border border-white/10 bg-white/5 text-fuchsia-300">
+                <svg style="width:1.1rem;height:1.1rem" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8L19 13M15 9h.01M17.8 6.2L19 5M3 21l9-9M12.2 6.2L11 5"/>
+                </svg>
+              </span>
+              <div>
+                <h3 class="flex flex-wrap items-center gap-2 text-base font-semibold text-white">
+                  Humanize text
+                  <span class="rounded-full border border-fuchsia-500/30 bg-fuchsia-500/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-fuchsia-300">Experimental</span>
+                </h3>
+                <p id="rewriteStatus" class="mt-0.5 text-xs text-slate-500">Experimental · 100% local, free &amp; private. First use downloads a small LLM (~600 MB, one-time).</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="px-6 py-6">
+            <div class="flex flex-wrap items-center gap-3">
+              <button id="rewriteBtn" disabled
+                class="inline-flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-fuchsia-500 to-violet-500 px-6 py-3 text-sm font-bold text-white shadow-lg shadow-fuchsia-500/25 transition hover:from-fuchsia-400 hover:to-violet-400 disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none">
+                <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8L19 13M15 9h.01M17.8 6.2L19 5M3 21l9-9M12.2 6.2L11 5"/>
+                </svg>
+                Humanize text
+              </button>
+              <button id="rewriteCancelBtn" class="hidden inline-flex items-center justify-center gap-2 rounded-xl border border-rose-500/40 bg-rose-500/10 px-6 py-3 text-sm font-semibold text-rose-300 transition hover:bg-rose-500/20">
+                <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+                Cancel
+              </button>
+              <span class="text-xs text-slate-500">Rewrites the textarea content chunk-by-chunk with a local LLM — no cloud, no cost.</span>
+            </div>
+
+            <label for="rewriteOutput" class="mt-6 block text-sm font-medium text-slate-300">Rewritten output</label>
+            <textarea id="rewriteOutput" readonly rows="10"
+              placeholder="Your humanized text will appear here as it's generated…"
+              class="mt-2 h-64 w-full resize-y rounded-xl border border-white/10 bg-ink-950/80 p-4 font-mono text-sm leading-relaxed text-slate-200 placeholder:text-slate-600"></textarea>
+
+            <div class="mt-4 flex flex-wrap items-center gap-3">
+              <button id="rewriteUseBtn" disabled
+                class="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-4 py-2 text-xs font-bold text-emerald-300 transition hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-40">
+                Use in analyzer (compare scores)
+              </button>
+              <button id="rewriteCopyBtn" disabled
+                class="rounded-lg border border-white/10 bg-white/5 px-4 py-2 text-xs font-semibold text-slate-300 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40">Copy</button>
+              <button id="rewriteDownloadBtn" disabled
+                class="rounded-lg border border-white/10 bg-white/5 px-4 py-2 text-xs font-semibold text-slate-300 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40">Download .txt</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <!-- ============ HOW IT WORKS ============ -->
+    <section id="how" class="mx-auto mt-24 max-w-5xl scroll-mt-24">
+      <h2 class="text-center text-2xl font-bold tracking-tight text-white sm:text-3xl">How it works</h2>
+      <p class="mx-auto mt-3 max-w-xl text-center text-sm text-slate-400">Three steps, zero data leaving your device.</p>
+      <div class="mt-10 grid gap-5 sm:grid-cols-3">
+        <div class="rounded-2xl border border-white/10 bg-white/[0.03] p-6 transition hover:border-violet-500/30 hover:bg-violet-500/5">
+          <div class="flex h-10 w-10 items-center justify-center rounded-lg bg-violet-500/15 text-violet-300">
+            <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h5"/></svg>
+          </div>
+          <h3 class="mt-4 font-semibold text-white">1 · Feed it content</h3>
+          <p class="mt-2 text-sm leading-relaxed text-slate-400">Paste text directly, or upload a PDF, DOCX, TXT or Markdown file — it's extracted right in your browser.</p>
+        </div>
+        <div class="rounded-2xl border border-white/10 bg-white/[0.03] p-6 transition hover:border-violet-500/30 hover:bg-violet-500/5">
+          <div class="flex h-10 w-10 items-center justify-center rounded-lg bg-fuchsia-500/15 text-fuchsia-300">
+            <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.7 5.7 1.9-5.7 1.9L12 18.2l-1.9-5.7L4.4 10.6l5.7-1.9z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/></svg>
+          </div>
+          <h3 class="mt-4 font-semibold text-white">2 · Local analysis</h3>
+          <p class="mt-2 text-sm leading-relaxed text-slate-400">Statistical heuristics score rhythm, word choice and phrasing patterns — entirely client-side, in milliseconds.</p>
+        </div>
+        <div class="rounded-2xl border border-white/10 bg-white/[0.03] p-6 transition hover:border-violet-500/30 hover:bg-violet-500/5">
+          <div class="flex h-10 w-10 items-center justify-center rounded-lg bg-cyan-500/15 text-cyan-300">
+            <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6l7-3z"/><path d="M9 12l2 2 4-4"/></svg>
+          </div>
+          <h3 class="mt-4 font-semibold text-white">3 · Instant verdict</h3>
+          <p class="mt-2 text-sm leading-relaxed text-slate-400">Get an AI-probability score plus a plain-English verdict you can trust at a glance.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ PRIVACY STRIP ============ -->
+    <section id="privacy" class="mx-auto mt-20 max-w-4xl scroll-mt-24">
+      <div class="flex flex-col items-center gap-4 rounded-2xl border border-emerald-500/20 bg-emerald-500/5 px-8 py-6 text-center sm:flex-row sm:text-left">
+        <span class="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-emerald-500/15 text-emerald-300">
+          <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        </span>
+        <div>
+          <h3 class="font-semibold text-white">Your content is never uploaded</h3>
+          <p class="mt-1 text-sm text-slate-400">File parsing and analysis run on JavaScript engines loaded in your browser. No servers, no cookies, no tracking.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ============ FOOTER ============ -->
+  <footer class="border-t border-white/5">
+    <div class="mx-auto flex max-w-6xl flex-col items-center justify-between gap-3 px-6 py-8 text-xs text-slate-600 sm:flex-row">
+      <span>© 2026 Sentinel AI — built as a client-side demo.</span>
+      <span class="inline-flex items-center gap-2">
+        <span class="h-1.5 w-1.5 rounded-full bg-emerald-400"></span>
+        All processing happens in your browser
+      </span>
+    </div>
+  </footer>
+
+  <!-- Toasts -->
+  <div id="toastContainer" class="pointer-events-none fixed bottom-6 right-6 z-50 flex w-80 flex-col gap-3"></div>
+
+  <script type="module" src="script.js"></script>
+</body>
+</html>
