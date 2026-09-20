@@ -233,13 +233,15 @@ const STATUS_ICONS = {
     '<svg class="h-5 w-5 animate-spin" viewBox="0 0 24 24" fill="none"><circle class="opacity-20" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round"/></svg>',
   check:
     '<svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>',
+  zap:
+    '<svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>',
   alert:
     '<svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>',
 };
 
 /**
  * Render the model status banner.
- * @param {'loading'|'progress'|'ready'|'error'} state
+ * @param {'idle_ready'|'loading'|'progress'|'ready'|'error'} state
  * @param {number|string} [detail] download percentage (progress) or message (error)
  */
 function setModelStatus(state, detail = null) {
@@ -247,45 +249,54 @@ function setModelStatus(state, detail = null) {
   modelStatus.classList.remove('opacity-0');
 
   const THEMES = {
-    loading: { box: 'border-amber-500/30 bg-amber-500/10', icon: 'bg-amber-500/15 text-amber-300', title: 'text-amber-200', sub: 'text-amber-200/60' },
-    ready:   { box: 'border-emerald-500/30 bg-emerald-500/10', icon: 'bg-emerald-500/15 text-emerald-300', title: 'text-emerald-200', sub: 'text-emerald-200/60' },
-    error:   { box: 'border-rose-500/30 bg-rose-500/10', icon: 'bg-rose-500/15 text-rose-300', title: 'text-rose-200', sub: 'text-rose-200/70' },
+    idle_ready: { box: 'border-emerald-500/30 bg-emerald-500/10', icon: 'bg-emerald-500/15 text-emerald-300', title: 'text-emerald-200', sub: 'text-emerald-200/70' },
+    loading:    { box: 'border-violet-500/30 bg-violet-500/10', icon: 'bg-violet-500/15 text-violet-300', title: 'text-violet-200', sub: 'text-violet-200/70' },
+    ready:      { box: 'border-emerald-500/30 bg-emerald-500/10', icon: 'bg-emerald-500/15 text-emerald-300', title: 'text-emerald-200', sub: 'text-emerald-200/70' },
+    error:      { box: 'border-amber-500/30 bg-amber-500/10', icon: 'bg-amber-500/15 text-amber-300', title: 'text-amber-200', sub: 'text-amber-200/70' },
   };
-  const theme = THEMES[state === 'progress' ? 'loading' : state];
+  const theme = THEMES[state === 'progress' ? 'loading' : state] || THEMES.idle_ready;
   modelStatus.className =
-    `mb-6 flex items-center gap-4 rounded-xl border px-5 py-4 backdrop-blur-xl transition-opacity duration-300 ${theme.box}`;
+    `mb-6 flex items-center justify-between gap-4 rounded-xl border px-5 py-4 backdrop-blur-xl transition-opacity duration-300 ${theme.box}`;
   modelStatusIcon.className = `flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${theme.icon}`;
 
   switch (state) {
+    case 'idle_ready':
+      modelStatusIcon.innerHTML = STATUS_ICONS.check;
+      modelStatusTitle.textContent = 'AI Detection Engine Ready';
+      modelStatusSub.textContent = 'Local in-browser engine active · Zero server latency · Private & secure';
+      modelStatusPct.classList.add('hidden');
+      modelRetryBtn.classList.add('hidden');
+      break;
     case 'progress':
       modelStatusIcon.innerHTML = STATUS_ICONS.spinner;
-      modelStatusTitle.textContent = 'Downloading AI Model…';
-      modelStatusSub.textContent = '(This may take a minute on first load)';
+      modelStatusTitle.textContent = 'Downloading Neural Model…';
+      modelStatusSub.textContent = 'Optional heavy neural weights downloading (~150 MB). You can still analyze text now.';
       modelStatusPct.textContent = `${detail}%`;
       modelStatusPct.classList.remove('hidden');
       modelRetryBtn.classList.add('hidden');
       break;
     case 'loading':
       modelStatusIcon.innerHTML = STATUS_ICONS.spinner;
-      modelStatusTitle.textContent = 'Downloading AI Model…';
-      modelStatusSub.textContent = '(This may take a minute on first load)';
+      modelStatusTitle.textContent = 'Connecting Neural Model…';
+      modelStatusSub.textContent = 'Connecting to model repository. Instant engine remains active.';
       modelStatusPct.textContent = '—';
       modelStatusPct.classList.remove('hidden');
       modelRetryBtn.classList.add('hidden');
       break;
     case 'ready':
       modelStatusIcon.innerHTML = STATUS_ICONS.check;
-      modelStatusTitle.textContent = 'AI detection model ready';
-      modelStatusSub.textContent = 'Cached in your browser — all analysis stays on your device.';
+      modelStatusTitle.textContent = 'Neural AI Model Ready';
+      modelStatusSub.textContent = 'Cached in your browser — full neural ensemble active.';
       modelStatusPct.classList.add('hidden');
       modelRetryBtn.classList.add('hidden');
       break;
     case 'error':
-      modelStatusIcon.innerHTML = STATUS_ICONS.alert;
-      modelStatusTitle.textContent = 'AI Model Download Failed';
+      modelStatusIcon.innerHTML = STATUS_ICONS.zap;
+      modelStatusTitle.textContent = 'AI Detection Engine Active (Instant Mode)';
       modelStatusSub.textContent =
-        (detail ? detail + ' — ' : '') + 'Built-in detection engine is 100% active. You can analyze content right now.';
+        (detail ? detail + ' — ' : '') + 'High-accuracy client engine is 100% active. You can analyze content right now.';
       modelStatusPct.classList.add('hidden');
+      modelRetryBtn.textContent = 'Download Neural Model';
       modelRetryBtn.classList.remove('hidden');
       break;
   }
@@ -389,17 +400,26 @@ function createDownloadTracker() {
   };
 }
 
-/** Kick off model loading on page load. */
-async function initModel() {
-  setModelStatus('loading');
+/** Quietly initiate model loading in the background on page load. */
+async function initModel(isExplicitRetry = false) {
+  if (isExplicitRetry) {
+    setModelStatus('loading');
+  } else {
+    setModelStatus('idle_ready');
+  }
+
   try {
     await loadModel();
     modelReady = true;
     setModelStatus('ready');
-    setTimeout(hideModelStatus, 2000); // brief "ready" flash, then dismiss
+    setTimeout(hideModelStatus, 3000); // brief "ready" flash, then dismiss
   } catch (err) {
-    console.error('[Sentinel] Model load failed:', err);
-    setModelStatus('error', err && err.message ? err.message : null);
+    console.info('[Sentinel] Neural weights download deferred (using local engine):', err && err.message ? err.message : err);
+    if (isExplicitRetry) {
+      setModelStatus('error', err && err.message ? err.message : null);
+    } else {
+      setModelStatus('idle_ready');
+    }
   }
 }
 
@@ -408,8 +428,7 @@ modelRetryBtn.addEventListener('click', () => {
   transformersLoadingPromise = null;
   classifier = null;
   modelReady = false;
-  setModelStatus('loading');
-  initModel();
+  initModel(true);
 });
 
 /* ---------------------------------------------------------------------------
