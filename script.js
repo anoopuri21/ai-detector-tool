@@ -282,9 +282,9 @@ function setModelStatus(state, detail = null) {
       break;
     case 'error':
       modelStatusIcon.innerHTML = STATUS_ICONS.alert;
-      modelStatusTitle.textContent = 'Model failed to load';
+      modelStatusTitle.textContent = 'AI Model Download Failed';
       modelStatusSub.textContent =
-        (detail ? detail + ' — ' : '') + 'Built-in heuristic detection engine is active and ready to analyze.';
+        (detail ? detail + ' — ' : '') + 'Built-in detection engine is 100% active. You can analyze content right now.';
       modelStatusPct.classList.add('hidden');
       modelRetryBtn.classList.remove('hidden');
       break;
@@ -300,8 +300,9 @@ function hideModelStatus() {
 /**
  * Configure environment settings on the transformers object to ensure
  * stable in-browser execution across various hosting environments.
+ * Note: remoteHost MUST end with a trailing slash to prevent broken URL concatenation!
  */
-function configureTransformersEnv(transformers, remoteHost = 'https://huggingface.co') {
+function configureTransformersEnv(transformers, remoteHost = null) {
   if (!transformers || !transformers.env) return;
   const env = transformers.env;
 
@@ -315,10 +316,10 @@ function configureTransformersEnv(transformers, remoteHost = 'https://huggingfac
   env.allowLocalModels = false;
   env.allowRemoteModels = true;
   env.useBrowserCache = true;
-  if (remoteHost) {
-    env.remoteHost = remoteHost;
-    env.remotePathTemplate = '{model}/resolve/{revision}/';
-  }
+  
+  const host = remoteHost || 'https://huggingface.co/';
+  env.remoteHost = host.endsWith('/') ? host : host + '/';
+  env.remotePathTemplate = '{model}/resolve/{revision}/';
 }
 
 /**
@@ -336,7 +337,7 @@ async function loadModel(retryWithMirror = true) {
 
   modelLoading = true;
   try {
-    configureTransformersEnv(transformers, 'https://huggingface.co');
+    configureTransformersEnv(transformers, 'https://huggingface.co/');
     classifier = await transformers.pipeline('text-classification', MODEL_ID, {
       quantized: true,
       progress_callback: createDownloadTracker(),
@@ -347,7 +348,7 @@ async function loadModel(retryWithMirror = true) {
     if (retryWithMirror) {
       console.info('[Sentinel] Retrying with Hugging Face mirror...');
       try {
-        configureTransformersEnv(transformers, 'https://hf-mirror.com');
+        configureTransformersEnv(transformers, 'https://hf-mirror.com/');
         classifier = await transformers.pipeline('text-classification', MODEL_ID, {
           quantized: true,
           progress_callback: createDownloadTracker(),
@@ -1204,7 +1205,7 @@ async function loadRewriter() {
   if (!transformers) throw new Error('The transformers.js library could not be loaded from CDNs.');
   rewriterLoading = true;
   try {
-    configureTransformersEnv(transformers, 'https://huggingface.co');
+    configureTransformersEnv(transformers, 'https://huggingface.co/');
     rewriter = await transformers.pipeline('text-generation', REWRITER_MODEL, {
       dtype: 'q4', // browser-friendly quantization (use 'q8' for higher quality on desktops with RAM to spare)
       progress_callback: (p) => {
@@ -1219,7 +1220,7 @@ async function loadRewriter() {
   } catch (err) {
     console.warn('[Sentinel] Primary rewriter model load failed:', err);
     try {
-      configureTransformersEnv(transformers, 'https://hf-mirror.com');
+      configureTransformersEnv(transformers, 'https://hf-mirror.com/');
       rewriter = await transformers.pipeline('text-generation', REWRITER_MODEL, {
         dtype: 'q4',
       });
