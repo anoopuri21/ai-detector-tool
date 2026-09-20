@@ -20,16 +20,61 @@
 'use strict';
 
 /* ---------------------------------------------------------------------------
- * transformers.js — loaded from the CDN as an ES module (see <script
- * type="module"> in index.html). The import is kicked off immediately so it
- * downloads in parallel with the page, but we deliberately do NOT block the
- * rest of the app on it: if the CDN is unreachable, the UI still works and
- * analysis falls back to the built-in heuristic.
+ * Multi-CDN Resilience for transformers.js
+ * If primary jsDelivr CDN fails, times out, or is blocked by an ad-blocker or
+ * ISP, seamlessly falls back to alternative CDNs (esm.sh, unpkg).
+ * On retry, clears cached promises so the user can re-attempt cleanly.
  * ------------------------------------------------------------------------- */
-const TRANSFORMERS_CDN = 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2'; // pinned for stability
-const transformersPromise = import(TRANSFORMERS_CDN).catch((err) => {
-  console.warn('[Sentinel] transformers.js failed to load:', err);
-  return null;
+const TRANSFORMERS_CDNS = [
+  'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2',
+  'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/dist/transformers.min.js',
+  'https://esm.sh/@xenova/transformers@2.17.2',
+  'https://unpkg.com/@xenova/transformers@2.17.2/dist/transformers.min.js',
+];
+
+let transformersModule = null;
+let transformersLoadingPromise = null;
+
+/**
+ * Robust dynamic loader for transformers.js with multi-CDN fallback.
+ */
+async function getTransformers() {
+  if (transformersModule) return transformersModule;
+  if (transformersLoadingPromise) return transformersLoadingPromise;
+
+  transformersLoadingPromise = (async () => {
+    let lastErr = null;
+    for (const cdnUrl of TRANSFORMERS_CDNS) {
+      try {
+        const mod = await Promise.race([
+          import(/* webpackIgnore: true */ cdnUrl),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error(`Timeout loading from ${cdnUrl}`)), 12000)
+          ),
+        ]);
+        const instance = mod && (mod.pipeline ? mod : mod.default && mod.default.pipeline ? mod.default : null);
+        if (instance) {
+          transformersModule = instance;
+          console.info(`[Sentinel] Successfully loaded transformers.js from: ${cdnUrl}`);
+          return transformersModule;
+        }
+      } catch (err) {
+        lastErr = err;
+        console.warn(`[Sentinel] Failed to load transformers.js from ${cdnUrl}:`, err && err.message ? err.message : err);
+      }
+    }
+    transformersLoadingPromise = null; // reset on error so retry works
+    throw new Error(
+      `Could not load AI engine from CDN (${lastErr ? lastErr.message : 'Network error'}).`
+    );
+  })();
+
+  return transformersLoadingPromise;
+}
+
+// Kick off early load in parallel with page render
+getTransformers().catch((err) => {
+  console.warn('[Sentinel] Initial background CDN prefetch deferred:', err && err.message ? err.message : err);
 });
 
 /* ---------------------------------------------------------------------------
@@ -239,7 +284,7 @@ function setModelStatus(state, detail = null) {
       modelStatusIcon.innerHTML = STATUS_ICONS.alert;
       modelStatusTitle.textContent = 'Model failed to load';
       modelStatusSub.textContent =
-        detail || 'Check your internet connection. Analysis will use the built-in heuristic until the model is available.';
+        (detail ? detail + ' — ' : '') + 'Built-in heuristic detection engine is active and ready to analyze.';
       modelStatusPct.classList.add('hidden');
       modelRetryBtn.classList.remove('hidden');
       break;
@@ -253,25 +298,67 @@ function hideModelStatus() {
 }
 
 /**
+ * Configure environment settings on the transformers object to ensure
+ * stable in-browser execution across various hosting environments.
+ */
+function configureTransformersEnv(transformers, remoteHost = 'https://huggingface.co') {
+  if (!transformers || !transformers.env) return;
+  const env = transformers.env;
+
+  // Single-thread WASM prevents errors when SharedArrayBuffer is unavailable
+  // (standard in browser environments lacking Cross-Origin-Isolation headers)
+  if (env.backends && env.backends.onnx && env.backends.onnx.wasm) {
+    env.backends.onnx.wasm.numThreads = 1;
+    env.backends.onnx.wasm.proxy = false;
+  }
+
+  env.allowLocalModels = false;
+  env.allowRemoteModels = true;
+  env.useBrowserCache = true;
+  if (remoteHost) {
+    env.remoteHost = remoteHost;
+    env.remotePathTemplate = '{model}/resolve/{revision}/';
+  }
+}
+
+/**
  * Load the text-classification pipeline. transformers.js downloads the model
  * weights on first use and caches them in the browser (Cache API), so later
  * visits load it instantly.
  */
-async function loadModel() {
+async function loadModel(retryWithMirror = true) {
   if (classifier) return classifier;
 
-  const transformers = await transformersPromise;
+  const transformers = await getTransformers();
   if (!transformers) {
     throw new Error('The transformers.js CDN is unreachable.');
   }
 
   modelLoading = true;
   try {
+    configureTransformersEnv(transformers, 'https://huggingface.co');
     classifier = await transformers.pipeline('text-classification', MODEL_ID, {
       quantized: true,
       progress_callback: createDownloadTracker(),
     });
     return classifier;
+  } catch (primaryErr) {
+    console.warn('[Sentinel] Primary model load failed:', primaryErr);
+    if (retryWithMirror) {
+      console.info('[Sentinel] Retrying with Hugging Face mirror...');
+      try {
+        configureTransformersEnv(transformers, 'https://hf-mirror.com');
+        classifier = await transformers.pipeline('text-classification', MODEL_ID, {
+          quantized: true,
+          progress_callback: createDownloadTracker(),
+        });
+        return classifier;
+      } catch (mirrorErr) {
+        console.warn('[Sentinel] Mirror model load also failed:', mirrorErr);
+        throw new Error(mirrorErr && mirrorErr.message ? mirrorErr.message : primaryErr.message);
+      }
+    }
+    throw primaryErr;
   } finally {
     modelLoading = false;
   }
@@ -316,6 +403,10 @@ async function initModel() {
 }
 
 modelRetryBtn.addEventListener('click', () => {
+  transformersModule = null;
+  transformersLoadingPromise = null;
+  classifier = null;
+  modelReady = false;
   setModelStatus('loading');
   initModel();
 });
@@ -655,10 +746,11 @@ async function classifyChunks(chunks, text, onChunk) {
   };
 }
 
-/* --------------------- Heuristic fallback (placeholder) ------------------- */
+/* --------------------- Heuristic fallback & stylometric engine ------------------- */
 
-/** Well-known LLM-typical words and phrases. */
+/** Well-known LLM-typical words, transitions, and rhetorical markers. */
 const AI_PHRASES = [
+  // Classic clichés
   'delve', 'delves', 'delving', 'landscape', 'tapestry', 'moreover', 'furthermore',
   'in conclusion', "it's important to note", 'it is important to note',
   "in today's world", 'in the modern world', 'game-changer', 'game changer',
@@ -669,40 +761,105 @@ const AI_PHRASES = [
   'underscore', 'underscores', 'comprehensive', 'meticulous', 'first and foremost',
   'last but not least', 'needless to say', 'it goes without saying',
   'without a doubt', 'one thing is certain', 'when it comes to', 'at the end of the day',
+
+  // Modern LLM transition starters & discourse connectives
+  'in addition', 'additionally', 'consequently', 'ultimately', 'notably',
+  'specifically', 'in summary', 'in essence', 'crucially', 'importantly',
+  'as a result', 'for instance', 'for example', 'in particular', 'to begin with',
+  'conversely', 'hence', 'thus', 'therefore', 'on the other hand', 'by contrast',
+  'it is worth noting', 'it is essential to', 'plays a crucial role',
+  'plays a vital role', 'plays a key role', 'serves as', 'at the forefront of',
+  'a wide range of', 'a myriad of', 'shedding light on', 'paving the way',
+  'paramount', 'nuanced', 'intertwined', 'holistic', 'fostering',
+  'revolutionize', 'transformative', 'beacon', 'cornerstone',
+  'vital component', 'indispensable', 'it can be argued that',
+  'a delicate balance', 'foster collaboration'
 ];
 
 function computeScore(text) {
   const words = text.toLowerCase().match(/[a-z']+/g) || [];
   const total = words.length;
-  const sentences = text.split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter(Boolean);
+  if (!total) return { score: 0, metrics: [0, 0, 0], total: 0, sentences: 0 };
+
+  const sentences = text
+    .split(/(?<=[.!?…])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
   const sentenceLens = sentences.map((s) => (s.match(/\S+/g) || []).length);
+  const numSentences = Math.max(sentences.length, 1);
 
-  // 1) Phrase predictability — density of LLM-typical phrasing (per 1k words).
-  const lower = ' ' + text.toLowerCase() + ' ';
+  // 1) Phrase predictability — density of modern LLM discourse & cliché markers
+  const lower = ' ' + text.toLowerCase().replace(/[^a-z0-9'\s]/g, ' ') + ' ';
   let hits = 0;
-  for (const p of AI_PHRASES) if (lower.includes(p)) hits++;
-  const density = hits / Math.max(total / 1000, 1);
-  const predictability = clamp(Math.round(density * 22), 0, 100);
+  for (const p of AI_PHRASES) {
+    const rx = new RegExp(`\\b${p.replace(/'/g, "'?")}\\b`, 'gi');
+    const matches = lower.match(rx);
+    if (matches) hits += matches.length;
+  }
+  const markerDensity = hits / Math.max(total / 100, 1);
+  const predictability = clamp(Math.round(markerDensity * 26 + (hits >= 2 ? 22 : hits === 1 ? 12 : 0)), 0, 100);
 
-  // 2) Sentence uniformity — AI text has very even sentence lengths.
-  const mean = sentenceLens.length
-    ? sentenceLens.reduce((a, b) => a + b, 0) / sentenceLens.length
-    : 0;
-  const sd = sentenceLens.length
-    ? Math.sqrt(sentenceLens.reduce((a, b) => a + (b - mean) ** 2, 0) / sentenceLens.length)
-    : 0;
-  const cv = mean ? sd / mean : 0;
-  const uniformity = clamp(Math.round((1 - Math.min(cv, 1)) * 100), 0, 100);
+  // 2) Sentence uniformity (Burstiness & length distribution)
+  const mean = sentenceLens.reduce((a, b) => a + b, 0) / numSentences;
+  const variance = sentenceLens.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / numSentences;
+  const sd = Math.sqrt(variance);
+  const cv = mean > 0 ? sd / mean : 0; // Coefficient of variation
 
-  // 3) Lexical repetition — low vocabulary variety.
-  const unique = new Set(words).size;
-  const diversity = total ? unique / total : 0;
-  const repetition = clamp(Math.round(((0.6 - diversity) / 0.6) * 100), 0, 100);
+  let lengthUniformity = 0;
+  if (cv < 0.20) lengthUniformity = 95;
+  else if (cv < 0.32) lengthUniformity = 85;
+  else if (cv < 0.42) lengthUniformity = 72;
+  else if (cv < 0.52) lengthUniformity = 55;
+  else if (cv < 0.65) lengthUniformity = 32;
+  else lengthUniformity = 10;
 
-  let score = predictability * 0.45 + uniformity * 0.35 + repetition * 0.2;
-  if (mean > 24) score += 6;                 // long, smooth sentences
-  if (mean > 0 && mean < 8) score -= 6;      // choppy, human-like rhythm
-  if (total < 40) score *= 0.6;              // very short samples → less confident
+  // AI sentence length clustering (12 - 28 words sweet spot)
+  let sweetSpotCount = 0;
+  for (const len of sentenceLens) {
+    if (len >= 12 && len <= 28) sweetSpotCount++;
+  }
+  const sweetSpotRatio = sweetSpotCount / numSentences;
+  const uniformity = clamp(Math.round(lengthUniformity * 0.65 + sweetSpotRatio * 35), 0, 100);
+
+  // 3) Lexical distribution & impersonality
+  const personalPronouns = ['i', 'me', 'my', 'myself', 'we', 'our', 'ours', 'us', 'you', 'your', 'yours'];
+  let pronounCount = 0;
+  for (const w of words) {
+    if (personalPronouns.includes(w)) pronounCount++;
+  }
+  const pronounRatio = pronounCount / total;
+
+  // Conversational contractions (don't, can't, it's, I'd, we're)
+  const contractions = (text.match(/\b(i'm|i've|i'd|i'll|don't|doesn't|didn't|can't|won't|wouldn't|shouldn't|couldn't|wasn't|weren't|isn't|aren't|haven't|hasn't|hadn't|let's|that's|what's|there's|here's|you're|you've|you'll|we're|we've|they're)\b/gi) || []).length;
+
+  // Punctuation variety (Humans use ! ? ; : " " — AI mostly . ,)
+  const expressivePunct = (text.match(/[!?—–;:()"]/g) || []).length;
+  const punctRatio = expressivePunct / numSentences;
+
+  let repetitionScore = 45;
+  if (pronounRatio === 0) repetitionScore += 30; // impersonal AI register
+  else if (pronounRatio < 0.02) repetitionScore += 10;
+  else if (pronounRatio > 0.03) repetitionScore -= 25;
+
+  if (punctRatio < 0.3) repetitionScore += 15;
+  else if (punctRatio > 0.7) repetitionScore -= 20;
+
+  const repetition = clamp(Math.round(repetitionScore), 0, 100);
+
+  // Core stylometric composite score
+  let score = predictability * 0.38 + uniformity * 0.42 + repetition * 0.20;
+
+  // Modifiers
+  if (hits >= 3) score += 12;
+  if (hits >= 5) score += 15;
+  if (cv < 0.35 && mean >= 14 && mean <= 28) score += 10;
+  if (pronounRatio > 0.02) score -= 18;
+  if (pronounRatio > 0.04) score -= 15;
+  if (contractions >= 1) score -= 14;
+  if (contractions >= 3) score -= 12;
+  if (cv > 0.60) score -= 18;
+  if (text.includes('!') || text.includes('?')) score -= 8;
+  if (total < 40 && hits === 0) score *= 0.6;
 
   score = clamp(Math.round(score), 2, 98);
   return {
@@ -970,6 +1127,27 @@ async function runAnalysis() {
     return;
   }
 
+  // 5.5) Hybrid Ensemble Calibration:
+  // 2019-era RoBERTa was trained on GPT-2 and often produces false negatives on modern LLMs (GPT-4/Claude/Gemini).
+  // Fuse with the enhanced stylometric engine to ensure modern AI generated text is accurately detected!
+  if (result.method === 'model') {
+    const stylometric = computeScore(text);
+    if (stylometric.score >= 80 && result.score < 40) {
+      result.score = clamp(Math.round(0.15 * result.score + 0.85 * stylometric.score), 2, 98);
+      if (Array.isArray(result.perChunk)) {
+        result.perChunk.forEach((c) => {
+          if (c.pct < 40) {
+            c.pct = clamp(Math.round(0.2 * c.pct + 0.8 * stylometric.score), 2, 98);
+          }
+        });
+      }
+    } else if (stylometric.score >= 65 && result.score < 45) {
+      result.score = clamp(Math.round(0.25 * result.score + 0.75 * stylometric.score), 2, 98);
+    } else if (stylometric.score <= 20 && result.score <= 35) {
+      result.score = Math.min(result.score, stylometric.score);
+    }
+  }
+
   // 6) Show the results: AI percentage ring, headline, verdict + breakdown.
   renderResult(result);
   progressWrap.classList.add('hidden');
@@ -1022,10 +1200,11 @@ function setRewriteStatus(state, detail = '') {
 
 async function loadRewriter() {
   if (rewriter) return rewriter;
-  const transformers = await transformersPromise;
-  if (!transformers) throw new Error('The transformers.js CDN is unreachable.');
+  const transformers = await getTransformers();
+  if (!transformers) throw new Error('The transformers.js library could not be loaded from CDNs.');
   rewriterLoading = true;
   try {
+    configureTransformersEnv(transformers, 'https://huggingface.co');
     rewriter = await transformers.pipeline('text-generation', REWRITER_MODEL, {
       dtype: 'q4', // browser-friendly quantization (use 'q8' for higher quality on desktops with RAM to spare)
       progress_callback: (p) => {
@@ -1037,6 +1216,19 @@ async function loadRewriter() {
     rewriterReady = true;
     setRewriteStatus('ready');
     return rewriter;
+  } catch (err) {
+    console.warn('[Sentinel] Primary rewriter model load failed:', err);
+    try {
+      configureTransformersEnv(transformers, 'https://hf-mirror.com');
+      rewriter = await transformers.pipeline('text-generation', REWRITER_MODEL, {
+        dtype: 'q4',
+      });
+      rewriterReady = true;
+      setRewriteStatus('ready');
+      return rewriter;
+    } catch {
+      throw err;
+    }
   } finally {
     rewriterLoading = false;
   }
